@@ -1,0 +1,11 @@
+numpy
+soundcard
+websockets
+python-dotenv
+openai
+PySide6
+pypdf
+python-docx
+
+# Build only (used by build.ps1 to produce IronStack.exe)
+pyinstaller
