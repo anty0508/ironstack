@@ -36,9 +36,15 @@ BASE_DIR = _base_dir()
 load_dotenv(BASE_DIR / ".env")
 load_dotenv()
 load_dotenv(resource_path(".env"))
-DATA_DIR = BASE_DIR / "data"
+
+# Local multi-instance testing: set IRONSTACK_INSTANCE=<tag> (e.g. 2) to give
+# this process its own data dir -- a separate DB, settings and network identity
+# (host id / pairing code) -- so it can run alongside the primary instance and
+# discover/connect to it as a distinct peer.
+INSTANCE_ID = os.getenv("IRONSTACK_INSTANCE", "").strip()
+
+DATA_DIR = BASE_DIR / (f"data-{INSTANCE_ID}" if INSTANCE_ID else "data")
 DB_PATH = DATA_DIR / "interview.db"
-LOG_PATH = DATA_DIR / "ironstack.log"
 
 # --- OpenAI (answer generation: text -> short answer) ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")

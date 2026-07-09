@@ -20,25 +20,31 @@ from config import (
     ENDPOINTING_MS,
     UTTERANCE_END_MS,
 )
-from services.audio_utils import find_loopback, resample
+from services.audio_utils import find_loopback, find_microphone, resample
 from logsetup import get_logger
 
 
 class Transcriber:
-    """Capture system (loopback) audio and stream it to Deepgram's real-time
+    """Capture an audio source and stream it to Deepgram's real-time
     speech-to-text API.
+
+    `source` selects what is captured:
+      - "loopback"   : system audio (the interviewer's voice) -- the default.
+      - "microphone" : the real mic (the candidate's own voice).
 
     Deepgram emits interim results word-by-word as soon as speech is heard;
     those are sent to `console.partial` (live line). When a pause finishes an
     utterance, the assembled final transcript is passed to `on_question`.
     """
 
-    def __init__(self, on_question, console, language=DEEPGRAM_LANGUAGE):
+    def __init__(self, on_question, console, language=DEEPGRAM_LANGUAGE,
+                 source="loopback"):
         if not DEEPGRAM_API_KEY:
             raise RuntimeError("DEEPGRAM_API_KEY is not set")
 
         self.on_question = on_question
         self.console = console
+        self.source = source
         self.audio_queue = queue.Queue()
         self.stop_event = threading.Event()
         self.finalized = []   # confirmed segments of the current utterance
@@ -53,6 +59,13 @@ class Transcriber:
     def stop(self):
         self.stop_event.set()
         self._wake(self._async_stop)
+
+    def restart(self):
+        """Force a reconnect of the Deepgram websocket (same language). Use when
+        transcription silently stops picking up speech; audio capture keeps
+        running across the brief gap."""
+        get_logger().info("transcription: manual restart requested (source=%s)", self.source)
+        self._wake(self._async_restart)
 
     def set_language(self, code):
         """Switch transcription language mid-meeting. Deepgram fixes the
@@ -94,19 +107,31 @@ class Transcriber:
             ctypes.windll.ole32.CoInitializeEx(None, 0)  # 0 = COINIT_MULTITHREADED
 
         try:
-            mic = find_loopback()
-            get_logger().info("audio: capturing from loopback %r", getattr(mic, "name", mic))
-            self.console.info("[audio] capturing system audio...")
+            # A real mic is usually mono; loopback follows the (stereo) speakers.
+            if self.source == "microphone":
+                device = find_microphone()
+                channels = 1
+                get_logger().info("audio: capturing from microphone %r",
+                                  getattr(device, "name", device))
+                self.console.info("[audio] capturing microphone...")
+            else:
+                device = find_loopback()
+                channels = 2
+                get_logger().info("audio: capturing from loopback %r",
+                                  getattr(device, "name", device))
+                self.console.info("[audio] capturing system audio...")
 
-            with mic.recorder(
+            with device.recorder(
                 samplerate=CAPTURE_SR,
-                channels=2,
+                channels=channels,
                 blocksize=BLOCK_FRAMES,
             ) as recorder:
                 while not self.stop_event.is_set():
                     data = recorder.record(numframes=BLOCK_FRAMES)
 
-                    mono = np.mean(data, axis=1)
+                    # Average to mono. record() returns shape (frames, channels),
+                    # so this collapses cleanly whether channels is 1 or 2.
+                    mono = np.mean(data, axis=1) if data.ndim > 1 else data
                     mono = resample(mono, CAPTURE_SR, TARGET_SR)
                     mono = np.clip(mono, -1, 1)
 

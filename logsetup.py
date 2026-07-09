@@ -1,4 +1,5 @@
-"""Application logging. Writes to data/ironstack.log (rotating).
+"""Application logging. Logs to the console (stderr) only — no log file is
+written.
 
 Call setup_logging() once at startup; use get_logger() everywhere else.
 setup_logging() also installs global hooks so *uncaught* exceptions — on the
@@ -8,16 +9,13 @@ main thread and on worker threads — always reach the log instead of vanishing.
 import logging
 import sys
 import threading
-from logging.handlers import RotatingFileHandler
-
-import config
 
 _NAME = "ironstack"
 _configured = False
 
 
 def setup_logging():
-    """Configure the app logger to write to config.LOG_PATH and install global
+    """Configure the app logger to write to the console and install global
     exception hooks. Idempotent, and never raises — logging must not stop the
     app from starting."""
     global _configured
@@ -26,10 +24,7 @@ def setup_logging():
         return logger
 
     try:
-        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-        handler = RotatingFileHandler(
-            config.LOG_PATH, maxBytes=2_000_000, backupCount=5, encoding="utf-8"
-        )
+        handler = logging.StreamHandler(sys.stderr)
         handler.setFormatter(
             logging.Formatter("%(asctime)s [%(levelname)s] %(threadName)s: %(message)s")
         )

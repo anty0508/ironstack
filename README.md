@@ -28,10 +28,13 @@ ui/            PySide6 windows
   tray.py        System-tray icon (show/hide/quit) and the app icon.
 
 services/      Live answering pipeline
-  transcriber.py Captures system audio and streams it to Deepgram STT.
-  audio_utils.py Finds the loopback device and resamples audio.
+  transcriber.py Captures an audio source (loopback OR mic) and streams it to Deepgram STT.
+  audio_utils.py Finds the loopback / microphone devices and resamples audio.
   answerer.py    Sends a question to the OpenAI Responses API.
   context.py     Builds the system prompt from the selected documents.
+  netlink.py     Discovery + Host↔Viewer streaming of the live meeting (TCP/UDP).
+  upnp.py        Best-effort automatic router port-opening (UPnP) so the host is
+                 reachable over the internet without manual port-forwarding.
 
 storage/       Data
   database.py    SQLite: documents, meetings, transcripts, settings.
@@ -73,6 +76,51 @@ tray icon** (left-click to show/hide, right-click for Quit) to reach the app.
 
 > Note: capturing system audio uses WASAPI loopback via `soundcard`, so this is
 > Windows-oriented.
+
+## Networking (Host / Viewer)
+
+The overlay can hide itself from screen capture, but that stealth silently fails
+under Remote Desktop and many VMs (no GPU/DWM composition). The networking
+feature is the workaround: run the meeting on the watched/remote machine (the
+**Host**) but read the transcript and answers on your own **local machine** (a
+**Viewer**), so nothing sensitive is ever drawn on the shared screen.
+
+- The **Host** captures **both** sides of the conversation — the interviewer
+  (system loopback) *and* the candidate's own voice (microphone) — transcribes
+  each, generates the AI answer, and streams all three as text to Viewers. It
+  broadcasts a UDP beacon so Viewers can discover it on the LAN.
+- A **Viewer** discovers hosts (or connects by IP) and mirrors the meeting live:
+  interviewer questions, the candidate's spoken answers ("You"), and the AI answer.
+  The candidate's talking is shown only on Viewers, not on the Host.
+
+**Hosting is automatic.** When you Start an interview, that PC becomes a Host and
+appears to Viewers — no host switch, no pairing code. Each Viewer that connects
+pops an **Accept / Reject** dialog on the Host; the stream flows only once the
+Host accepts. (The Viewer window has a blue brand dot to tell it from the Host.)
+
+Also over the wire (both directions): a **shared note** panel (a live two-way
+notepad), and **remote control** — toggling **Stealth**, hitting **⟳ Restart
+Deepgram**, or changing the **language** on either side is mirrored to the other.
+
+To join: open **Network** in the setup window, pick the discovered host — or type
+its IP/port (`127.0.0.1` : `48921` for same-PC testing; the last address is
+remembered) — and click *Join as Viewer*. Only text is sent over the wire, never
+audio.
+
+### Over the internet
+Auto-discovery only works on the same LAN. To reach a Host across the internet it
+must be reachable inbound, which residential NAT normally blocks. Options:
+
+- **UPnP (automatic).** On Start, the Host asks the router to open its port via
+  UPnP ([upnp.py](services/upnp.py)); if the router allows it, Viewers can connect
+  to the Host's public IP + port with no manual setup. The console logs whether it
+  succeeded.
+- **Manual port-forward.** Forward TCP `48921` (or your chosen port) on the Host's
+  router to the Host PC — only works if the ISP isn't using CGNAT.
+- **Tunnel** (Tailscale/ngrok) if UPnP is off and port-forwarding isn't possible.
+
+The Host's **listen port** is configurable in the Network page, so it can match a
+VPN/router forwarded port.
 
 ## Build a standalone .exe
 

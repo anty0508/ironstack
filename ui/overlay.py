@@ -29,7 +29,6 @@ Qt = QtCore.Qt
 # Win32 hotkey modifiers / messages
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
-MOD_SHIFT = 0x0004
 MOD_NOREPEAT = 0x4000
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
@@ -40,17 +39,12 @@ WDA_MONITOR = 0x01              # content shows as black in captures (Windows 7+
 WDA_EXCLUDEFROMCAPTURE = 0x11   # window invisible to captures (Win10 2004 / build 19041+)
 
 # Virtual key codes
-VK_UP = 0x26
-VK_DOWN = 0x28
-VK_H = 0x48
-VK_C = 0x43
-VK_P = 0x50
-VK_S = 0x53
+VK_H = 0x48   # show/hide
+VK_C = 0x43   # click-through
+VK_S = 0x53   # stealth
 
 # Hotkey ids
 HK_TOGGLE = 1
-HK_OPACITY_UP = 2
-HK_OPACITY_DOWN = 3
 HK_CLICKTHROUGH = 4
 HK_TOGGLE_CAPTURE = 5
 
@@ -383,25 +377,55 @@ class _Header(QtWidgets.QFrame):
 
 STYLE = """
 * { font-family: 'Segoe UI', sans-serif; color: #e8eaf0; }
+QToolTip {
+    background-color: #1c2029;
+    color: #e8eaf0;
+    border: 1px solid rgba(242,163,60,0.45);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font-size: 12px;
+}
 #panel {
     background: #12141a;
     border: 1px solid rgba(255,255,255,0.08);
     border-radius: 0;
 }
 #header { border-bottom: 1px solid rgba(255,255,255,0.06); }
-#appDot { color: #f2a33c; font-size: 14px; }
+#appDot { color: #f2a33c; font-size: 18px; }
 #title { font-size: 13px; font-weight: 600; color: #f2f3f7; }
 #subtitle { font-size: 11px; color: #8a90a2; }
+#sharePanel {
+    background: rgba(45,120,255,0.06);
+    border: 1px solid rgba(45,120,255,0.28);
+    border-radius: 10px;
+}
+#shareTag { font-size: 10px; font-weight: 700; color: #9fbcff; letter-spacing: 1px; }
+#shareEdit {
+    background: rgba(18,22,30,0.90);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 8px; color: #e8eaf0; font-size: 13px; padding: 6px;
+    selection-background-color: rgba(45,120,255,0.40);
+}
+#shareEdit:focus { border: 1px solid rgba(45,120,255,0.6); }
+QSplitter#bodySplit::handle { background: rgba(255,255,255,0.06); border-radius: 3px; }
+QSplitter#bodySplit::handle:horizontal { width: 6px; }
+QSplitter#bodySplit::handle:hover { background: rgba(45,120,255,0.55); }
 #winbtn {
     background: transparent; border: none; color: #9aa0b2;
-    font-size: 15px; font-weight: 600; padding: 0 6px;
+    font-size: 15px; font-weight: 600; padding: 0 3px;
 }
 #winbtn:hover { color: #ffffff; }
 #winbtn:pressed { background: transparent; }
 #winbtn:focus { outline: none; }
+#refreshbtn {
+    background: transparent; border: none; color: #9aa0b2;
+    font-size: 20px; padding: 0 2px;
+}
+#refreshbtn:hover { color: #ffffff; }
+#refreshbtn:focus { outline: none; }
 #langbox {
     background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.10);
-    border-radius: 8px; padding: 3px 8px; color: #cdd2de; font-size: 11px;
+    border-radius: 8px; padding: 2px 6px; color: #cdd2de; font-size: 11px;
 }
 #langbox:hover { border: 1px solid rgba(242,163,60,0.45); color: #ffffff; }
 #langbox::drop-down { border: none; width: 18px; }
@@ -436,8 +460,14 @@ QScrollArea { border: none; background: transparent; }
     border: 1px solid rgba(255,255,255,0.06);
     border-radius: 10px;
 }
+#ububble {
+    background: rgba(38, 56, 44, 0.92);
+    border: 1px solid rgba(143, 208, 127, 0.22);
+    border-radius: 10px;
+}
 #qtag { font-size: 10px; font-weight: 700; color: #7f8aa3; letter-spacing: 1px; }
 #aitag { font-size: 10px; font-weight: 700; color: #f2a33c; letter-spacing: 1px; }
+#utag { font-size: 10px; font-weight: 700; color: #8fd07f; letter-spacing: 1px; }
 #bubbletext { font-size: 14px; color: #e8eaf0; }
 #note { font-size: 11px; color: #6f7689; }
 #status { font-size: 11px; color: #6f7689; }
@@ -466,19 +496,31 @@ class Overlay(QtWidgets.QWidget):
     _sig_info = QtCore.Signal(str)
     _sig_partial = QtCore.Signal(str)
     _sig_question = QtCore.Signal(str)    # interviewer line (always shown)
+    _sig_user = QtCore.Signal(str)        # candidate's own spoken answer (final)
+    _sig_user_partial = QtCore.Signal(str)   # candidate's live (streaming) speech
     _sig_begin_answer = QtCore.Signal()   # an answer is about to stream
     _sig_delta = QtCore.Signal(str)
     _sig_end = QtCore.Signal(str)
     _sig_close = QtCore.Signal()
+    _sig_set_shared = QtCore.Signal(str)   # remote update -> set shared notepad text
+    _sig_connected = QtCore.Signal(bool)   # a network connection was established
+    _sig_set_language = QtCore.Signal(str, str)   # peer changed language -> reflect it
 
     end_meeting = QtCore.Signal()   # "End Meeting" clicked -> return to setup
     quit_app = QtCore.Signal()      # quit clicked -> exit the whole app
     language_changed = QtCore.Signal(str, str)   # (deepgram code, display name)
+    shared_text_changed = QtCore.Signal(str)     # local user edited the shared notepad
+    stealth_toggled = QtCore.Signal(bool)        # user toggled stealth -> sync to peer
+    refresh_requested = QtCore.Signal()          # user asked to restart transcription
 
-    def __init__(self, start_geometry=None, language_code=DEFAULT_LANGUAGE_CODE):
+    def __init__(self, start_geometry=None, language_code=DEFAULT_LANGUAGE_CODE,
+                 role="solo"):
         super().__init__()
         self._language_code = language_code or DEFAULT_LANGUAGE_CODE
-        self.setWindowTitle("IronStack")
+        self._role = role   # "host" | "viewer" | "solo"
+        title = {"host": "IronStack — Host",
+                 "viewer": "IronStack — Viewer"}.get(role, "IronStack")
+        self.setWindowTitle(title)
         self.setWindowFlags(
             Qt.FramelessWindowHint
             | Qt.WindowStaysOnTopHint
@@ -493,8 +535,10 @@ class Overlay(QtWidgets.QWidget):
         self.resize(580, 640)
 
         self._current_body = None
+        self._user_body = None         # the live, streaming "You" bubble (or None)
         self._answer_text = ""
         self._click_through = False
+        self._suppress_share = False   # True while applying a remote shared-text update
         self._bubbles = []
         self._caption_live = False     # True while real transcription is showing
         self._dots = 0
@@ -518,6 +562,11 @@ class Overlay(QtWidgets.QWidget):
         self._sig_info.connect(self._on_info)
         self._sig_partial.connect(self._on_partial)
         self._sig_question.connect(self._on_question)
+        self._sig_user.connect(self._on_user_answer)
+        self._sig_user_partial.connect(self._on_user_partial)
+        self._sig_set_shared.connect(self._on_set_shared_text)
+        self._sig_connected.connect(self._on_connected)
+        self._sig_set_language.connect(self._on_set_language)
         self._sig_begin_answer.connect(self._on_begin_answer)
         self._sig_delta.connect(self._on_delta)
         self._sig_end.connect(self._on_end)
@@ -545,7 +594,7 @@ class Overlay(QtWidgets.QWidget):
         header.setFixedHeight(44)
         h = QtWidgets.QHBoxLayout(header)
         h.setContentsMargins(12, 0, 6, 0)
-        h.setSpacing(6)
+        h.setSpacing(2)
 
         # Compact brand: amber dot + name, with a width-capped, elided status
         # line below (see _on_info) so it never overflows into the controls.
@@ -562,11 +611,16 @@ class Overlay(QtWidgets.QWidget):
         titles.addWidget(title)
         titles.addWidget(self.subtitle)
         h.addLayout(titles)
+
+        # No text badge in the header; just recolor the brand dot so a Viewer
+        # window stays subtly distinguishable from a Host window side by side.
+        if self._role == "viewer":
+            dot.setStyleSheet("color: #2d78ff;")
         h.addStretch(1)
 
         self.language_combo = QtWidgets.QComboBox()
         self.language_combo.setObjectName("langbox")
-        self.language_combo.setFixedWidth(98)
+        self.language_combo.setFixedWidth(82)
         self.language_combo.setFocusPolicy(Qt.NoFocus)
         self.language_combo.setCursor(Qt.PointingHandCursor)
         self.language_combo.setToolTip("Language (transcription + answers) — change anytime")
@@ -577,9 +631,20 @@ class Overlay(QtWidgets.QWidget):
         self.language_combo.currentIndexChanged.connect(self._on_language_changed)
         h.addWidget(self.language_combo)
 
+        self.share_toggle = QtWidgets.QPushButton("Note")
+        self.share_toggle.setObjectName("winbtn")
+        self.share_toggle.setFixedWidth(42)
+        self.share_toggle.setCursor(Qt.PointingHandCursor)
+        self.share_toggle.setFlat(True)
+        self.share_toggle.setCheckable(True)
+        self.share_toggle.setFocusPolicy(Qt.NoFocus)
+        self.share_toggle.setToolTip("Show/hide the shared note (available once connected)")
+        self.share_toggle.clicked.connect(lambda: self._toggle_share_panel())
+        h.addWidget(self.share_toggle)
+
         self.stealth_toggle = QtWidgets.QPushButton("Stealth")
         self.stealth_toggle.setObjectName("winbtn")
-        self.stealth_toggle.setFixedWidth(64)
+        self.stealth_toggle.setFixedWidth(52)
         self.stealth_toggle.setCursor(Qt.PointingHandCursor)
         self.stealth_toggle.setFlat(True)
         self.stealth_toggle.setFocusPolicy(Qt.NoFocus)
@@ -588,15 +653,15 @@ class Overlay(QtWidgets.QWidget):
         self._refresh_stealth_button()
         h.addWidget(self.stealth_toggle)
 
-        self.opacity_slider = QtWidgets.QSlider(Qt.Horizontal)
-        self.opacity_slider.setFixedWidth(64)
-        self.opacity_slider.setRange(30, 100)
-        self.opacity_slider.setValue(self._visibility_controller.opacity_percent)
-        self.opacity_slider.setToolTip("Opacity")
-        self.opacity_slider.valueChanged.connect(
-            lambda v: self._visibility_controller.set_opacity_percent(v)
-        )
-        h.addWidget(self.opacity_slider)
+        self.refresh_btn = QtWidgets.QPushButton("⟳")
+        self.refresh_btn.setObjectName("refreshbtn")
+        self.refresh_btn.setFixedWidth(30)
+        self.refresh_btn.setCursor(Qt.PointingHandCursor)
+        self.refresh_btn.setFlat(True)
+        self.refresh_btn.setFocusPolicy(Qt.NoFocus)
+        self.refresh_btn.setToolTip("Restart Deepgram")
+        self.refresh_btn.clicked.connect(self.refresh_requested.emit)
+        h.addWidget(self.refresh_btn)
 
         end_btn = QtWidgets.QPushButton("End")
         end_btn.setObjectName("endbtn")
@@ -638,6 +703,19 @@ class Overlay(QtWidgets.QWidget):
         body.setSpacing(10)
         root.addLayout(body)
 
+        # The meeting area (caption + chat) and the shared-notes panel live in a
+        # horizontal splitter so the divider can be dragged. The shared panel is
+        # hidden until a network connection is established.
+        self.body_split = QtWidgets.QSplitter(Qt.Horizontal)
+        self.body_split.setObjectName("bodySplit")
+        self.body_split.setChildrenCollapsible(False)
+
+        meeting_side = QtWidgets.QWidget()
+        meeting_side.setMinimumWidth(300)   # never let the note panel squeeze it out
+        ms = QtWidgets.QVBoxLayout(meeting_side)
+        ms.setContentsMargins(0, 0, 0, 0)
+        ms.setSpacing(10)
+
         # --- live caption box ---
         cap = QtWidgets.QFrame()
         cap.setObjectName("captionBox")
@@ -651,7 +729,7 @@ class Overlay(QtWidgets.QWidget):
         self.caption_label.setWordWrap(True)
         cv.addWidget(cap_tag)
         cv.addWidget(self.caption_label)
-        body.addWidget(cap)
+        ms.addWidget(cap)
 
         # --- chat ---
         self.scroll = QtWidgets.QScrollArea()
@@ -664,19 +742,113 @@ class Overlay(QtWidgets.QWidget):
         self.chat_layout.setSpacing(8)
         self.chat_layout.addStretch(1)
         self.scroll.setWidget(chat)
-        body.addWidget(self.scroll, 1)
+        ms.addWidget(self.scroll, 1)
+
+        self.body_split.addWidget(meeting_side)
+        self.body_split.addWidget(self._build_share_panel())
+        self.body_split.setStretchFactor(0, 7)
+        self.body_split.setStretchFactor(1, 3)
+        self.share_panel.hide()
+        # Re-fit chat bubbles to the left pane whenever the divider is dragged.
+        self.body_split.splitterMoved.connect(lambda *_: self._refresh_bubble_widths())
+        body.addWidget(self.body_split, 1)
 
         # --- status / hint ---
         self.status = QtWidgets.QLabel(
-            "Ctrl+Alt+H hide · Ctrl+Alt+C click-through · Ctrl+Alt+↑/↓ opacity"
+            "Ctrl+Alt+H hide · Ctrl+Alt+C click-through"
         )
         self.status.setObjectName("status")
         body.addWidget(self.status)
 
+        # Opacity control lives at the bottom-right now (out of the dense header).
         grip_row = QtWidgets.QHBoxLayout()
         grip_row.addStretch(1)
+        op_label = QtWidgets.QLabel("Opacity")
+        op_label.setObjectName("status")
+        grip_row.addWidget(op_label)
+        self.opacity_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.opacity_slider.setFixedWidth(90)
+        self.opacity_slider.setRange(30, 100)
+        self.opacity_slider.setValue(self._visibility_controller.opacity_percent)
+        self.opacity_slider.setToolTip("Opacity")
+        self.opacity_slider.valueChanged.connect(
+            lambda v: self._visibility_controller.set_opacity_percent(v)
+        )
+        grip_row.addWidget(self.opacity_slider)
+        grip_row.addSpacing(6)
         grip_row.addWidget(QtWidgets.QSizeGrip(panel))
         body.addLayout(grip_row)
+
+    def _build_share_panel(self):
+        """Right-side shared text panel: a live, two-way notepad both the local
+        user and the connected remote user can type in (like a shared editor).
+        Returns the panel widget (kept hidden until connected)."""
+        self.share_panel = QtWidgets.QFrame()
+        self.share_panel.setObjectName("sharePanel")
+        sp = QtWidgets.QVBoxLayout(self.share_panel)
+        sp.setContentsMargins(10, 8, 10, 10)
+        sp.setSpacing(6)
+
+        self.share_panel.setMinimumWidth(200)
+        row = QtWidgets.QHBoxLayout()
+        tag = QtWidgets.QLabel("● NOTE  ·  you ⇄ remote")
+        tag.setObjectName("shareTag")
+        row.addWidget(tag)
+        row.addStretch(1)
+        close = QtWidgets.QPushButton("×")
+        close.setObjectName("winbtn")
+        close.setCursor(Qt.PointingHandCursor)
+        close.setToolTip("Close the note (reopen with the ‘Note’ button)")
+        close.clicked.connect(lambda: self._toggle_share_panel(False))
+        row.addWidget(close)
+        sp.addLayout(row)
+
+        self.share_edit = QtWidgets.QPlainTextEdit()
+        self.share_edit.setObjectName("shareEdit")
+        self.share_edit.setPlaceholderText(
+            "Shared note — both sides can type here. Text syncs live.")
+        self.share_edit.textChanged.connect(self._on_share_text_changed)
+        sp.addWidget(self.share_edit, 1)
+        self._refresh_share_button()
+        return self.share_panel
+
+    def _toggle_share_panel(self, show=None):
+        """Show/hide the note panel. When showing, size the split ~70/30 based on
+        the splitter's real width so the panel sits beside the meeting area
+        rather than on top of it."""
+        if show is None:
+            show = not self.share_panel.isVisible()
+        self.share_panel.setVisible(show)
+        if show:
+            # Defer sizing to the next event-loop turn so the splitter has its
+            # final width (e.g. right after a window resize on connect).
+            QtCore.QTimer.singleShot(0, self._apply_split_sizes)
+        if hasattr(self, "share_toggle"):
+            self.share_toggle.setChecked(show)
+            self._refresh_share_button()
+
+    def _apply_split_sizes(self):
+        w = self.body_split.width()
+        if w <= 0:
+            w = self.width()
+        self.body_split.setSizes([int(w * 0.7), int(w * 0.3)])
+        QtCore.QTimer.singleShot(0, self._refresh_bubble_widths)
+
+    def _refresh_share_button(self):
+        on = self.share_panel.isVisible()
+        self.share_toggle.setStyleSheet(
+            "font-size:12px; font-weight:600; background: rgba(90,150,242,0.22);"
+            " color: #9fbcff; border-radius:7px;"
+            if on else
+            "font-size:12px; font-weight:600; background: transparent;"
+            " color: #9aa0b2; border: none;")
+
+    def _on_share_text_changed(self):
+        # Local edit -> tell the app to send it over the network. Suppressed while
+        # we're applying a remote update (so we don't echo it back).
+        if getattr(self, "_suppress_share", False):
+            return
+        self.shared_text_changed.emit(self.share_edit.toPlainText())
 
     def _place(self, anchor):
         # Open where the setup window was, so the interview window doesn't jump
@@ -696,21 +868,34 @@ class Overlay(QtWidgets.QWidget):
     # ---------- bubbles ----------
 
     def _bubble_width(self):
-        return max(220, int(self.width() * 0.78))
+        # Size bubbles to the chat's own viewport, NOT the whole window -- once
+        # the note panel opens, the window is wider than the left (chat) pane, and
+        # window-relative bubbles would spill under the note panel.
+        try:
+            ref = self.scroll.viewport().width()
+        except Exception:
+            ref = self.width()
+        return max(200, int(ref * 0.92))
+
+    def _refresh_bubble_widths(self):
+        w = self._bubble_width()
+        for frame in self._bubbles:
+            frame.setFixedWidth(w)
 
     def _add_bubble(self, role):
         is_ai = role == "AI"
+        is_user = role == "You"
 
-        # each message sits in a row; a stretch pushes it left (interviewer)
-        # or right (AI), like a normal chat app. Newest turns are inserted at
-        # the top, so the row is added at index 0.
+        # each message sits in a row; a stretch pushes it left (AI) or right
+        # (interviewer / the candidate's own speech), like a normal chat app.
+        # Newest turns are inserted at the top, so the row is added at index 0.
         row = QtWidgets.QWidget()
         rl = QtWidgets.QHBoxLayout(row)
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(0)
 
         frame = QtWidgets.QFrame()
-        frame.setObjectName("abubble" if is_ai else "qbubble")
+        frame.setObjectName("abubble" if is_ai else "ububble" if is_user else "qbubble")
         frame.setFixedWidth(self._bubble_width())
         self._bubbles.append(frame)
 
@@ -719,7 +904,7 @@ class Overlay(QtWidgets.QWidget):
         v.setSpacing(4)
 
         tag = QtWidgets.QLabel(("● " + role) if is_ai else role.upper())
-        tag.setObjectName("aitag" if is_ai else "qtag")
+        tag.setObjectName("aitag" if is_ai else "utag" if is_user else "qtag")
         v.addWidget(tag)
 
         body = QtWidgets.QLabel("")
@@ -733,7 +918,7 @@ class Overlay(QtWidgets.QWidget):
             rl.addStretch(1)        # AI answer -> left
         else:
             rl.addStretch(1)
-            rl.addWidget(frame)     # interviewer question -> right
+            rl.addWidget(frame)     # interviewer question / candidate answer -> right
 
         self.chat_layout.insertWidget(0, row)
         self._scroll_to_top()
@@ -745,9 +930,7 @@ class Overlay(QtWidgets.QWidget):
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
-        w = self._bubble_width()
-        for frame in self._bubbles:
-            frame.setFixedWidth(w)
+        self._refresh_bubble_widths()
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -849,6 +1032,73 @@ class Overlay(QtWidgets.QWidget):
         self._current_body = None
         self._caption_live = False     # resume listening animation
 
+    @QtCore.Slot(str)
+    def _on_user_partial(self, text):
+        # Live, token-by-token streaming of the candidate's own speech into a
+        # "You" bubble (the same immediacy as the interviewer's live caption).
+        if not text:
+            return
+        if self._user_body is None:
+            self._user_body, _ = self._add_bubble("You")
+            self._user_body.setTextFormat(Qt.PlainText)
+        self._user_body.setText(text)
+        self._scroll_to_top()
+
+    @QtCore.Slot(str)
+    def _on_user_answer(self, text):
+        # Finalize the candidate's spoken answer. If a live bubble is streaming,
+        # lock it in; otherwise make one. Never triggers an AI answer.
+        if self._user_body is not None:
+            self._user_body.setText(text)
+            self._user_body = None
+        else:
+            body, _ = self._add_bubble("You")
+            body.setTextFormat(Qt.PlainText)
+            body.setText(text)
+        self._current_body = None
+
+    @QtCore.Slot(str)
+    def _on_set_shared_text(self, text):
+        # Apply a remote update to the shared notepad without echoing it back,
+        # keeping the caret where it was so local typing isn't disrupted.
+        if text == self.share_edit.toPlainText():
+            return
+        self._suppress_share = True
+        cursor = self.share_edit.textCursor()
+        pos = cursor.position()
+        self.share_edit.setPlainText(text)
+        cursor = self.share_edit.textCursor()
+        cursor.setPosition(min(pos, len(text)))
+        self.share_edit.setTextCursor(cursor)
+        self._suppress_share = False
+
+    @QtCore.Slot(bool)
+    def _on_connected(self, connected):
+        if connected:
+            self.share_toggle.setEnabled(True)
+            # Widen the window once so the note panel has room beside the meeting
+            # area instead of squeezing it.
+            if not getattr(self, "_widened_for_note", False):
+                self._widened_for_note = True
+                self.resize(self.width() + 340, self.height())
+            if not self.share_panel.isVisible():
+                self._toggle_share_panel(True)
+            self.info("[network] connected — shared note is open")
+
+    @QtCore.Slot(str, str)
+    def _on_set_language(self, code, name):
+        # Reflect a language change made by the peer on our own picker, WITHOUT
+        # re-emitting language_changed (which would bounce it back and loop).
+        if not code or code == self._language_code:
+            return
+        self._language_code = code
+        idx = self.language_combo.findData(code)
+        if idx >= 0:
+            self.language_combo.blockSignals(True)
+            self.language_combo.setCurrentIndex(idx)
+            self.language_combo.blockSignals(False)
+        self.info(f"[language] {name or code}")
+
     @QtCore.Slot()
     def _on_begin_answer(self):
         # The answer streams in above the question that was just added, so the
@@ -883,8 +1133,6 @@ class Overlay(QtWidgets.QWidget):
         # Ctrl+Alt+H (show/hide) is owned by the shared visibility controller so
         # it works for the setup window too; the rest are overlay-only.
         self.hotkeys = GlobalHotkeys([
-            (HK_OPACITY_UP, MOD_CONTROL | MOD_ALT, VK_UP),
-            (HK_OPACITY_DOWN, MOD_CONTROL | MOD_ALT, VK_DOWN),
             (HK_CLICKTHROUGH, MOD_CONTROL | MOD_ALT, VK_C),
         ])
         self.hotkeys.triggered.connect(self._on_hotkey)
@@ -892,11 +1140,7 @@ class Overlay(QtWidgets.QWidget):
 
     @QtCore.Slot(int)
     def _on_hotkey(self, hid):
-        if hid == HK_OPACITY_UP:
-            self.opacity_slider.setValue(min(100, self.opacity_slider.value() + 5))
-        elif hid == HK_OPACITY_DOWN:
-            self.opacity_slider.setValue(max(30, self.opacity_slider.value() - 5))
-        elif hid == HK_CLICKTHROUGH:
+        if hid == HK_CLICKTHROUGH:
             self._toggle_click_through()
 
     def _on_language_changed(self, _idx):
@@ -930,7 +1174,7 @@ class Overlay(QtWidgets.QWidget):
         )
 
     def _refresh_status(self, applied):
-        base = "Ctrl+Alt+H hide · Ctrl+Alt+C click-through · Ctrl+Alt+↑/↓ opacity · Ctrl+Alt+S stealth"
+        base = "Ctrl+Alt+H hide · Ctrl+Alt+C click-through · Ctrl+Alt+S stealth"
         if self._click_through:
             base = "CLICK-THROUGH ON · Ctrl+Alt+C to disable"
         if applied:
@@ -946,6 +1190,8 @@ class Overlay(QtWidgets.QWidget):
         )
         self._capture_excluded = self._visibility_controller.capture_excluded
         self._apply_capture_exclusion()
+        # Tell the peer so stealth stays in sync across host and viewer.
+        self.stealth_toggled.emit(self._capture_excluded)
 
     def _toggle_click_through(self):
         self._click_through = not self._click_through
@@ -1032,6 +1278,21 @@ class Overlay(QtWidgets.QWidget):
 
     def show_question(self, text):
         self._sig_question.emit(text)
+
+    def show_user_answer(self, text):
+        self._sig_user.emit(text)
+
+    def user_partial(self, text):
+        self._sig_user_partial.emit(text or "")
+
+    def set_shared_text(self, text):
+        self._sig_set_shared.emit(text or "")
+
+    def set_connected(self, connected=True):
+        self._sig_connected.emit(bool(connected))
+
+    def set_language(self, code, name=""):
+        self._sig_set_language.emit(code or "", name or "")
 
     def begin_answer(self):
         self._sig_begin_answer.emit()

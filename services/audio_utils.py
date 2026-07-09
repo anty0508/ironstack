@@ -13,6 +13,22 @@ def find_loopback():
     return mics[0]
 
 
+def find_microphone():
+    """The real microphone (the candidate's own voice), not a loopback device.
+    Prefers the system default input; falls back to the first physical mic."""
+    try:
+        mic = sc.default_microphone()
+        if mic is not None:
+            return mic
+    except Exception:
+        pass
+
+    mics = sc.all_microphones(include_loopback=False)
+    if not mics:
+        raise RuntimeError("no microphone found")
+    return mics[0]
+
+
 def resample(audio, src, dst):
     if src == dst:
         return audio

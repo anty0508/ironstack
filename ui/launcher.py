@@ -35,12 +35,18 @@ NAV = [
     ("project", "Projects"),
     ("reference", "References"),
     ("preferences", "Preferences"),
+    ("network", "Network"),
     ("history", "Past meetings"),
 ]
 
 
 STYLE = """
 * { font-family: 'Segoe UI', sans-serif; color: #e8eaf0; font-size: 13px; }
+QToolTip {
+    background-color: #1c2029; color: #e8eaf0;
+    border: 1px solid rgba(242,163,60,0.45);
+    border-radius: 6px; padding: 4px 8px; font-size: 12px;
+}
 #panel { background: #14161c; border: 1px solid rgba(255,255,255,0.09); border-radius: 0; }
 
 #header { background: transparent; }
@@ -577,8 +583,15 @@ class _DocSection(QtWidgets.QWidget):
 
 
 class Launcher(QtWidgets.QDialog):
-    def __init__(self, hide_from_taskbar=True):
+    def __init__(self, hide_from_taskbar=True, net=None):
         super().__init__()
+        # Networking controller (shared with main). When the user picks "Join as
+        # viewer" the launcher accepts with mode="viewer" and viewer_target set;
+        # otherwise it accepts with mode="host" and Start begins the interview
+        # (which auto-hosts).
+        self.net = net
+        self.mode = "host"
+        self.viewer_target = None
         self.setWindowTitle("IronStack — Setup")
         flags = Qt.FramelessWindowHint | Qt.Dialog
         if hide_from_taskbar:
@@ -695,16 +708,6 @@ class Launcher(QtWidgets.QDialog):
         self._refresh_stealth_button()
         hl.addWidget(self.stealth_toggle)
         hl.addSpacing(6)
-        self.opacity_slider = QtWidgets.QSlider(Qt.Horizontal)
-        self.opacity_slider.setFixedWidth(90)
-        self.opacity_slider.setRange(30, 100)
-        self.opacity_slider.setValue(self._visibility_controller.opacity_percent)
-        self.opacity_slider.setToolTip("Opacity")
-        self.opacity_slider.valueChanged.connect(
-            lambda v: self._visibility_controller.set_opacity_percent(v)
-        )
-        hl.addWidget(self.opacity_slider)
-        hl.addSpacing(6)
 
         self.pin_toggle = QtWidgets.QPushButton("📌")
         self.pin_toggle.setObjectName("winbtn")
@@ -752,6 +755,7 @@ class Launcher(QtWidgets.QDialog):
         for w in (self.resume, self.jd, self.projects, self.references):
             self.stack.addWidget(w)
         self.stack.addWidget(self._build_preferences_page())
+        self.stack.addWidget(self._build_network_page())
         self.stack.addWidget(self._build_history_page())
         body.addWidget(self.stack, 1)
 
@@ -763,10 +767,40 @@ class Launcher(QtWidgets.QDialog):
         fl.setSpacing(16)
 
         fl.addLayout(self._field("INTERVIEW", "title_edit",
-                                 "e.g. OX Security — Backend Engineer", 260))
-        fl.addLayout(self._field("COMPANY", "company_edit", "e.g. OX Security", 180))
-        fl.addLayout(self._language_field())
-        fl.addStretch(1)
+                                 "e.g. OX Security — Backend Engineer", 320), 4)
+        fl.addLayout(self._field("COMPANY", "company_edit", "e.g. OX Security", 240), 3)
+        fl.addLayout(self._language_field(), 2)
+
+        # Opacity styled exactly like the other fields: a "OPACITY" label on top,
+        # then the slider inside a holder the SAME height as the text inputs and
+        # vertically centered in it. So the label lines up with the other labels
+        # and the slider sits at the same vertical center as the input boxes.
+        op_col = QtWidgets.QVBoxLayout()
+        op_col.setSpacing(3)
+        op_lbl = QtWidgets.QLabel("OPACITY")
+        op_lbl.setObjectName("fieldLabel")
+        self.opacity_slider = QtWidgets.QSlider(Qt.Horizontal)
+        self.opacity_slider.setMinimumWidth(90)
+        self.opacity_slider.setMaximumWidth(170)
+        self.opacity_slider.setRange(30, 100)
+        self.opacity_slider.setValue(self._visibility_controller.opacity_percent)
+        self.opacity_slider.setToolTip("Opacity")
+        self.opacity_slider.valueChanged.connect(
+            lambda v: self._visibility_controller.set_opacity_percent(v)
+        )
+        op_holder = QtWidgets.QWidget()
+        # Expand to fill the same vertical band as the text inputs, so the
+        # centered slider lines up with the input boxes' center.
+        op_holder.setSizePolicy(QtWidgets.QSizePolicy.Preferred,
+                                QtWidgets.QSizePolicy.Expanding)
+        oh = QtWidgets.QHBoxLayout(op_holder)
+        oh.setContentsMargins(0, 0, 0, 0)
+        oh.addWidget(self.opacity_slider)
+        op_col.addWidget(op_lbl)
+        op_col.addWidget(op_holder)
+        fl.addLayout(op_col, 2)
+
+        fl.addSpacing(16)
 
         grip = QtWidgets.QSizeGrip(footer)
         quit_btn = QtWidgets.QPushButton("Quit")
@@ -809,7 +843,10 @@ class Launcher(QtWidgets.QDialog):
         lbl.setObjectName("fieldLabel")
         edit = QtWidgets.QLineEdit()
         edit.setPlaceholderText(placeholder)
-        edit.setFixedWidth(width)
+        # Shrinkable (min) up to a cap (max) instead of a hard fixed width, so a
+        # narrow window compresses the fields rather than overlapping them.
+        edit.setMinimumWidth(80)
+        edit.setMaximumWidth(width)
         setattr(self, attr, edit)
         col.addWidget(lbl)
         col.addWidget(edit)
@@ -823,7 +860,8 @@ class Launcher(QtWidgets.QDialog):
         lbl = QtWidgets.QLabel("LANGUAGE")
         lbl.setObjectName("fieldLabel")
         self.language_combo = QtWidgets.QComboBox()
-        self.language_combo.setFixedWidth(170)
+        self.language_combo.setMinimumWidth(90)
+        self.language_combo.setMaximumWidth(210)
         for label, code in LANGUAGES:
             self.language_combo.addItem(label, code)
         idx = self.language_combo.findData(self.language_code)
@@ -862,6 +900,178 @@ class Launcher(QtWidgets.QDialog):
 
     def _save_preferences(self):
         database.set_setting("preferences", self.prefs_edit.toPlainText().strip())
+
+    # ---- network page ----
+
+    def _build_network_page(self):
+        page, layout = _page(
+            "Network",
+            "Run the meeting on this PC and mirror the live transcript + answers "
+            "to a second IronStack on your own machine (a Viewer). The Host does "
+            "all the work; the Viewer only displays.",
+        )
+
+        if self.net is None:
+            note = QtWidgets.QLabel("Networking is unavailable.")
+            note.setObjectName("pageHint")
+            layout.addWidget(note)
+            layout.addStretch(1)
+            return page
+
+        # --- this instance's name ---
+        name_lbl = QtWidgets.QLabel("THIS DEVICE'S NAME")
+        name_lbl.setObjectName("fieldLabel")
+        layout.addWidget(name_lbl)
+        name_row = QtWidgets.QHBoxLayout()
+        self.name_edit = QtWidgets.QLineEdit(self.net.name)
+        self.name_edit.setPlaceholderText("e.g. Home-PC")
+        save_name = QtWidgets.QPushButton("Save name")
+        save_name.setObjectName("ghost")
+        save_name.clicked.connect(self._save_instance_name)
+        name_row.addWidget(self.name_edit, 1)
+        name_row.addWidget(save_name)
+        layout.addLayout(name_row)
+
+        layout.addSpacing(10)
+
+        # --- host section (automatic) ---
+        host_lbl = QtWidgets.QLabel("HOST")
+        host_lbl.setObjectName("fieldLabel")
+        layout.addWidget(host_lbl)
+        host_note = QtWidgets.QLabel(
+            "Hosting is automatic: when you Start an interview, this PC listens on "
+            "the port below and each Viewer that connects asks your permission. "
+            "Set this to the port your VPN/router forwards to this PC (e.g. an "
+            "Astrill port-forwarding port). Takes effect on the next interview.")
+        host_note.setObjectName("pageHint")
+        host_note.setWordWrap(True)
+        layout.addWidget(host_note)
+
+        host_port_row = QtWidgets.QHBoxLayout()
+        hp_lbl = QtWidgets.QLabel("This host listens on port:")
+        hp_lbl.setObjectName("pageHint")
+        self.listen_port_edit = QtWidgets.QLineEdit(str(self.net.tcp_port))
+        self.listen_port_edit.setFixedWidth(90)
+        set_port = QtWidgets.QPushButton("Set")
+        set_port.setObjectName("ghost")
+        set_port.clicked.connect(self._save_listen_port)
+        host_port_row.addWidget(hp_lbl)
+        host_port_row.addWidget(self.listen_port_edit)
+        host_port_row.addWidget(set_port)
+        host_port_row.addStretch(1)
+        layout.addLayout(host_port_row)
+
+        layout.addSpacing(12)
+
+        # --- viewer section ---
+        join_lbl = QtWidgets.QLabel("VIEWER — JOIN A MEETING")
+        join_lbl.setObjectName("fieldLabel")
+        layout.addWidget(join_lbl)
+
+        hint = QtWidgets.QLabel("Pick a discovered host, or type its address, then Join.")
+        hint.setObjectName("pageHint")
+        layout.addWidget(hint)
+
+        self.hosts_list = QtWidgets.QListWidget()
+        self.hosts_list.setObjectName("doclist")
+        self.hosts_list.setMaximumHeight(140)
+        self.hosts_list.itemSelectionChanged.connect(self._on_host_selected)
+        self.hosts_list.itemDoubleClicked.connect(lambda _=None: self._join_viewer())
+        layout.addWidget(self.hosts_list)
+
+        addr_row = QtWidgets.QHBoxLayout()
+        # Remember the last host/port typed, so you don't retype them each time.
+        self.host_ip_edit = QtWidgets.QLineEdit(database.get_setting("viewer_host_ip", ""))
+        self.host_ip_edit.setPlaceholderText("Host IP (e.g. 192.168.1.20 or 127.0.0.1)")
+        self.host_port_edit = QtWidgets.QLineEdit(
+            database.get_setting("viewer_host_port", ""))
+        self.host_port_edit.setPlaceholderText("Port")
+        self.host_port_edit.setFixedWidth(80)
+        addr_row.addWidget(self.host_ip_edit, 1)
+        addr_row.addWidget(self.host_port_edit)
+        layout.addLayout(addr_row)
+
+        join_row = QtWidgets.QHBoxLayout()
+        join_row.addStretch(1)
+        join_btn = QtWidgets.QPushButton("Join as Viewer")
+        join_btn.setObjectName("primary")
+        join_btn.setCursor(Qt.PointingHandCursor)
+        join_btn.clicked.connect(self._join_viewer)
+        join_row.addWidget(join_btn)
+        layout.addLayout(join_row)
+
+        # Start discovery and refresh the host list + status on a timer while the
+        # setup window is open.
+        self.net.start_discovery()
+        self._net_timer = QtCore.QTimer(self)
+        self._net_timer.setInterval(1000)
+        self._net_timer.timeout.connect(self._refresh_network)
+        self._net_timer.start()
+        self._refresh_network()
+
+        return page
+
+    def _save_instance_name(self):
+        self.net.set_name(self.name_edit.text())
+        self._refresh_network()
+
+    def _save_listen_port(self):
+        try:
+            port = int(self.listen_port_edit.text().strip())
+            if not (1 <= port <= 65535):
+                raise ValueError
+        except ValueError:
+            self._warn("Port must be a number between 1 and 65535.")
+            return
+        self.net.set_tcp_port(port)
+        self._warn(f"Host port set to {port}. It takes effect the next time you "
+                   "Start an interview.")
+
+    def _on_host_selected(self):
+        item = self.hosts_list.currentItem()
+        if item is None:
+            return
+        peer = item.data(Qt.UserRole)
+        if peer:
+            self.host_ip_edit.setText(peer["ip"])
+            self.host_port_edit.setText(str(peer["tcp_port"]))
+
+    def _refresh_network(self):
+        if self.net is None:
+            return
+        # Discovered hosts (preserve the current selection's address)
+        selected = self.hosts_list.currentItem()
+        sel_key = selected.data(Qt.UserRole)["ip"] + ":" + \
+            str(selected.data(Qt.UserRole)["tcp_port"]) if selected else None
+        self.hosts_list.clear()
+        for peer in self.net.peers():
+            if peer["host_id"] == self.net.host_id:
+                continue   # don't list ourselves
+            meeting = " · in meeting" if peer["in_meeting"] else " · idle"
+            label = f"{peer['name']}  ({peer['ip']}:{peer['tcp_port']}){meeting}"
+            item = QtWidgets.QListWidgetItem(label)
+            item.setData(Qt.UserRole, peer)
+            self.hosts_list.addItem(item)
+            if sel_key == peer["ip"] + ":" + str(peer["tcp_port"]):
+                self.hosts_list.setCurrentItem(item)
+
+    def _join_viewer(self):
+        ip = self.host_ip_edit.text().strip()
+        port_text = self.host_port_edit.text().strip()
+        if not ip:
+            self._warn("Enter a host IP (or pick one from the discovered list).")
+            return
+        try:
+            port = int(port_text) if port_text else self.net.tcp_port
+        except ValueError:
+            self._warn("Port must be a number.")
+            return
+        # Persist so they're pre-filled next time.
+        database.set_setting("viewer_host_ip", ip)
+        database.set_setting("viewer_host_port", str(port))
+        self.mode = "viewer"
+        self.viewer_target = (ip, port)
+        self.accept()
 
     # ---- history page ----
 
@@ -942,6 +1152,11 @@ class Launcher(QtWidgets.QDialog):
                     f"<p style='color:#9aa0b2'><b>Interviewer:</b> "
                     f"{html.escape(msg['content'])}</p>"
                 )
+            elif msg["role"] == "candidate":
+                parts.append(
+                    f"<p style='color:#8fd07f'><b>You:</b> "
+                    f"{html.escape(msg['content'])}</p>"
+                )
             else:
                 parts.append("<p style='color:#f2a33c'><b>AI</b></p>"
                              + Overlay._format_answer(msg["content"]))
@@ -973,6 +1188,8 @@ class Launcher(QtWidgets.QDialog):
         title = self.title_edit.text().strip() or \
             self.company_edit.text().strip() or "Interview"
         company = self.company_edit.text().strip()
+
+        self.mode = "host"   # hosting is started automatically in _run_interview
 
         self.meeting_id = database.create_meeting(title, company, doc_ids)
         docs = database.get_meeting_documents(self.meeting_id)
