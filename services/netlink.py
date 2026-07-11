@@ -35,6 +35,12 @@ BEACON_INTERVAL = 2.0       # seconds between UDP beacons
 BEACON_TTL = 6.0            # a host not heard from within this is dropped from discovery
 MAGIC = "IRONSTACK1"        # protocol tag, so we ignore unrelated UDP traffic
 
+# --- resilience on slow / lossy links ---
+PING_INTERVAL = 3.0         # viewer -> host keepalive cadence (host replies pong)
+LIVENESS_TIMEOUT = 10.0     # no data from the peer for this long -> link is dead
+CLIENT_IDLE_TIMEOUT = 25.0  # host drops a viewer socket after this much silence
+RESUME_TTL = 3600.0         # a reconnect resume token stays valid this long
+
 
 # --- small wire helpers ---
 
@@ -176,7 +182,8 @@ class NetServer:
     """Host side: accept Viewer connections (each approved by the host via
     `on_approve`) and broadcast meeting messages to all of them."""
 
-    def __init__(self, tcp_port, name="IronStack", on_approve=None, on_message=None):
+    def __init__(self, tcp_port, name="IronStack", on_approve=None, on_message=None,
+                 approved=None, on_approved_change=None):
         self.tcp_port = tcp_port
         self.name = name
         # on_approve(peer_dict) -> bool. Called on the handshake thread when a
@@ -189,6 +196,14 @@ class NetServer:
         self.in_meeting = False
         self._clients = []          # list of connected sockets
         self._lock = threading.Lock()
+        self._send_lock = threading.Lock()   # serialize sends (multi-thread safe)
+        self._resume = {}           # resume token -> expiry (monotonic, in-memory)
+        # Approved viewers persist so "accepted once" survives a host restart and
+        # stays valid for RESUME_TTL after the *last* disconnect. Wall-clock epoch
+        # (not monotonic) so it's meaningful across restarts.
+        #   {viewer_id: {"name": <str>, "ts": <epoch seconds>}}
+        self._approved_ids = dict(approved or {})
+        self._on_approved_change = on_approved_change
         self._stop = threading.Event()
         self._sock = None
 
@@ -216,39 +231,111 @@ class NetServer:
             threading.Thread(target=self._handshake, args=(conn, addr),
                              daemon=True).start()
 
+    def _resume_valid(self, token):
+        with self._lock:
+            exp = self._resume.get(token)
+            return exp is not None and exp > time.monotonic()
+
+    def _remember_resume(self, token):
+        now = time.monotonic()
+        with self._lock:
+            self._resume[token] = now + RESUME_TTL
+            for k in [k for k, v in self._resume.items() if v <= now]:
+                del self._resume[k]
+
+    def _approved_valid(self, vid):
+        with self._lock:
+            entry = self._approved_ids.get(vid)
+        if not entry:
+            return False
+        try:
+            return (time.time() - float(entry.get("ts", 0))) < RESUME_TTL
+        except (TypeError, ValueError):
+            return False
+
+    def _remember_approved(self, vid, name=""):
+        """Record/refresh a viewer's approval at the current wall-clock time (so the
+        RESUME_TTL window runs from the last activity/disconnect) and persist it."""
+        if not vid:
+            return
+        now = time.time()
+        with self._lock:
+            entry = self._approved_ids.get(vid) or {}
+            entry["ts"] = now
+            if name:
+                entry["name"] = name
+            entry.setdefault("name", "")
+            self._approved_ids[vid] = entry
+            for k in [k for k, v in list(self._approved_ids.items())
+                      if (now - float(v.get("ts", 0))) >= RESUME_TTL]:
+                del self._approved_ids[k]
+            snapshot = dict(self._approved_ids)
+        if self._on_approved_change is not None:
+            try:
+                self._on_approved_change(snapshot)
+            except Exception:
+                get_logger().exception("net: persisting approved peers failed")
+
+    def _safe_send(self, conn, msg):
+        """Send one message on a single client socket under the shared send lock,
+        so it never interleaves with a broadcast on the same socket."""
+        data = (json.dumps(msg) + "\n").encode("utf-8")
+        try:
+            with self._send_lock:
+                conn.sendall(data)
+            return True
+        except OSError:
+            return False
+
     def _handshake(self, conn, addr):
         try:
-            line = _recv_line(conn, timeout=15)
+            line = _recv_line(conn, timeout=20)
             hello = json.loads(line.decode("utf-8")) if line else {}
             peer = {"name": hello.get("name", "Viewer"), "ip": addr[0]}
-            get_logger().info("net: hello from %s (name=%r) -> awaiting host approval",
-                              addr[0], peer["name"])
+            resume = str(hello.get("resume", "") or "")
+            vid = str(hello.get("viewer_id", "") or "")
 
-            # Ask the host to approve this viewer (an Accept/Reject dialog on the
-            # host). This can block until the host clicks. No approver == accept.
-            approved = True
-            if self.on_approve is not None:
-                try:
-                    approved = bool(self.on_approve(peer))
-                except Exception:
-                    get_logger().exception("net: approval callback failed")
-                    approved = False
+            # A viewer we already approved reconnecting after a dropped link (common
+            # on slow networks) -> skip the dialog. Match on either the exchanged
+            # resume token OR the viewer's stable id (which survives a pre-welcome
+            # drop or a host restart within the window).
+            if (resume and self._resume_valid(resume)) or (vid and self._approved_valid(vid)):
+                get_logger().info("net: %s (%s) reconnected — no re-approval",
+                                  peer["name"], addr[0])
+                approved = True
+            else:
+                get_logger().info("net: hello from %s (name=%r) -> awaiting host approval",
+                                  addr[0], peer["name"])
+                # Ask the host to approve (Accept/Reject dialog); may block until
+                # the host clicks. No approver == accept.
+                approved = True
+                if self.on_approve is not None:
+                    try:
+                        approved = bool(self.on_approve(peer))
+                    except Exception:
+                        get_logger().exception("net: approval callback failed")
+                        approved = False
             if not approved:
-                _send_line(conn, {"type": "denied",
-                                  "reason": "the host declined the connection"})
+                self._safe_send(conn, {"type": "denied",
+                                       "reason": "the host declined the connection"})
                 conn.close()
                 get_logger().info("net: viewer %s (%s) declined by host",
                                   peer["name"], addr[0])
                 return
 
-            _send_line(conn, {"type": "welcome", "name": self.name,
-                              "in_meeting": self.in_meeting})
+            # Issue (or refresh) a resume token and remember this viewer's id so a
+            # reconnect won't re-prompt, whichever it presents next time.
+            token = resume if (resume and self._resume_valid(resume)) else uuid.uuid4().hex
+            self._remember_resume(token)
+            self._remember_approved(vid, peer["name"])
+            self._safe_send(conn, {"type": "welcome", "name": self.name,
+                                   "in_meeting": self.in_meeting, "resume": token})
             with self._lock:
                 self._clients.append(conn)
             get_logger().info("net: viewer connected from %s (name=%r)",
                               addr[0], peer["name"])
             # Full-duplex: read messages this viewer sends back (shared notepad).
-            self._client_recv(conn)
+            self._client_recv(conn, vid)
         except Exception:
             get_logger().exception("net: handshake failed for %s", addr[0])
             try:
@@ -256,7 +343,7 @@ class NetServer:
             except OSError:
                 pass
 
-    def _client_recv(self, conn):
+    def _client_recv(self, conn, vid=""):
         """Receive-loop for one connected viewer. Relays each message to the
         other viewers and hands it to the host's on_message handler. Runs on this
         connection's handshake thread until the viewer disconnects."""
@@ -265,7 +352,13 @@ class NetServer:
             conn.settimeout(0.5)
         except OSError:
             return
+        last_recv = time.monotonic()
+        last_refresh = last_recv
         while not self._stop.is_set():
+            if time.monotonic() - last_recv > CLIENT_IDLE_TIMEOUT:
+                get_logger().info("net: viewer silent >%.0fs -> dropping",
+                                  CLIENT_IDLE_TIMEOUT)
+                break
             try:
                 chunk = conn.recv(4096)
             except socket.timeout:
@@ -274,6 +367,13 @@ class NetServer:
                 break
             if not chunk:
                 break
+            last_recv = time.monotonic()
+            # Keep the "already approved" window alive while the viewer is actively
+            # connected, so even a session longer than RESUME_TTL won't re-prompt
+            # on a later reconnect. Throttled so it's not every packet.
+            if vid and last_recv - last_refresh > 30.0:
+                last_refresh = last_recv
+                self._remember_approved(vid)
             buf += chunk
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
@@ -282,6 +382,12 @@ class NetServer:
                 try:
                     msg = json.loads(line.decode("utf-8"))
                 except (ValueError, UnicodeDecodeError):
+                    continue
+                mtype = msg.get("type")
+                if mtype == "__ping":
+                    self._safe_send(conn, {"type": "__pong"})   # prove we're alive
+                    continue
+                if mtype == "__pong":
                     continue
                 self.send(msg, exclude=conn)    # keep other viewers in sync
                 if self.on_message:
@@ -296,6 +402,10 @@ class NetServer:
             conn.close()
         except OSError:
             pass
+        # Stamp the approval at disconnect time, so the RESUME_TTL window runs from
+        # the LAST disconnection (reconnect within it -> no re-approval).
+        if vid:
+            self._remember_approved(vid)
         get_logger().info("net: viewer disconnected")
 
     def send(self, msg, exclude=None):
@@ -305,13 +415,14 @@ class NetServer:
         with self._lock:
             clients = list(self._clients)
         dead = []
-        for c in clients:
-            if c is exclude:
-                continue
-            try:
-                c.sendall(data)
-            except OSError:
-                dead.append(c)
+        with self._send_lock:
+            for c in clients:
+                if c is exclude:
+                    continue
+                try:
+                    c.sendall(data)
+                except OSError:
+                    dead.append(c)
         if dead:
             with self._lock:
                 for c in dead:
@@ -347,13 +458,20 @@ class NetClient:
     """Viewer side: connect to a Host, complete the pairing handshake, and hand
     each received message to `on_message` (called on the receive thread)."""
 
-    def __init__(self, host, port, code="", name="", on_message=None, on_status=None):
+    def __init__(self, host, port, code="", name="", on_message=None, on_status=None,
+                 dialer=None, viewer_id=""):
         self.host = host
         self.port = int(port)
         self.code = str(code or "")
         self.name = name
+        self.viewer_id = str(viewer_id or "")   # stable id -> reconnect w/o re-approval
         self.on_message = on_message
         self.on_status = on_status
+        # dialer() -> a connected socket. When set (relay mode), it's used instead
+        # of a direct connection to host:port; the handshake below is unchanged.
+        self.dialer = dialer
+        self._resume_token = ""      # set from the host's welcome; skips re-approval
+        self._send_lock = threading.Lock()
         self._stop = threading.Event()
         self._sock = None
 
@@ -366,7 +484,9 @@ class NetClient:
         if sock is None:
             return
         try:
-            _send_line(sock, msg)
+            data = (json.dumps(msg) + "\n").encode("utf-8")
+            with self._send_lock:
+                sock.sendall(data)
         except OSError:
             pass
 
@@ -378,33 +498,77 @@ class NetClient:
                 get_logger().exception("net: viewer status callback failed")
 
     def _run(self):
-        try:
-            sock = socket.create_connection((self.host, self.port), timeout=10)
-        except OSError as exc:
-            self._status(f"connection failed: {exc}")
-            return
-        self._sock = sock
-        try:
-            _send_line(sock, {"type": "hello", "code": self.code, "name": self.name})
-        except OSError as exc:
-            self._status(f"connection failed: {exc}")
-            sock.close()
-            return
-        # TCP is up and the hello is sent; now we block until the host accepts.
-        self._status("waiting for host to accept…")
+        """Connect and stay connected: on any drop (a dead link, a slow-network
+        timeout, the host briefly gone) reconnect automatically, retrying with
+        backoff until stop() is called. A resume token skips re-approval so the
+        host isn't re-prompted on every reconnect."""
+        first = True
+        backoff = 1.0
+        while not self._stop.is_set():
+            try:
+                sock = (self.dialer() if self.dialer is not None
+                        else socket.create_connection((self.host, self.port), timeout=15))
+            except OSError as exc:
+                self._status(f"connection failed: {exc}" if first else "reconnecting…")
+                if self._stop.wait(backoff):
+                    break
+                backoff = min(backoff * 2, 5.0)
+                continue
+            backoff = 1.0
+            self._sock = sock
+            try:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+            except OSError:
+                pass
+            try:
+                with self._send_lock:
+                    _send_line(sock, {"type": "hello", "code": self.code,
+                                      "name": self.name, "resume": self._resume_token,
+                                      "viewer_id": self.viewer_id})
+            except OSError:
+                self._close_sock(sock)
+                first = False
+                continue
+            if first:
+                # TCP is up and the hello is sent; block until the host accepts.
+                self._status("waiting for host to accept…")
+            self._session_loop(sock)
+            self._close_sock(sock)
+            self._sock = None
+            if self._stop.is_set():
+                break
+            self._status("reconnecting…")
+            first = False
 
+    def _session_loop(self, sock):
+        """Read messages until the link dies. Sends a keepalive ping every few
+        seconds and treats LIVENESS_TIMEOUT seconds of silence as a dead link."""
         buf = b""
         sock.settimeout(0.5)
+        last_recv = time.monotonic()
+        last_ping = 0.0
         while not self._stop.is_set():
+            now = time.monotonic()
+            if now - last_ping >= PING_INTERVAL:
+                last_ping = now
+                try:
+                    with self._send_lock:
+                        _send_line(sock, {"type": "__ping"})
+                except OSError:
+                    return
+            if now - last_recv > LIVENESS_TIMEOUT:
+                get_logger().info("net: no data for %.0fs -> reconnecting",
+                                  LIVENESS_TIMEOUT)
+                return
             try:
                 chunk = sock.recv(4096)
             except socket.timeout:
                 continue
             except OSError:
-                break
+                return
             if not chunk:
-                self._status("host closed the connection")
-                break
+                return
+            last_recv = time.monotonic()
             buf += chunk
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
@@ -414,7 +578,19 @@ class NetClient:
                     msg = json.loads(line.decode("utf-8"))
                 except (ValueError, UnicodeDecodeError):
                     continue
+                mtype = msg.get("type")
+                if mtype == "__ping":
+                    try:
+                        with self._send_lock:
+                            _send_line(sock, {"type": "__pong"})
+                    except OSError:
+                        return
+                    continue
+                if mtype == "__pong":
+                    continue
                 self._dispatch(msg)
+
+    def _close_sock(self, sock):
         try:
             sock.close()
         except OSError:
@@ -427,6 +603,7 @@ class NetClient:
             self._stop.set()
             return
         if t == "welcome":
+            self._resume_token = msg.get("resume", self._resume_token)
             self._status("connected to " + msg.get("name", "host"))
             return
         if self.on_message:
@@ -574,8 +751,10 @@ def local_ip():
 class _HostNet:
     """Bundle of the host's TCP server + UDP beacon, started/stopped together."""
 
-    def __init__(self, name, host_id, tcp_port, on_approve=None):
-        self.server = NetServer(tcp_port, name=name, on_approve=on_approve)
+    def __init__(self, name, host_id, tcp_port, on_approve=None,
+                 approved=None, on_approved_change=None):
+        self.server = NetServer(tcp_port, name=name, on_approve=on_approve,
+                                approved=approved, on_approved_change=on_approved_change)
         self.beacon = Beacon(name, host_id, tcp_port)
 
     def start(self):
@@ -620,8 +799,14 @@ class NetController:
         except (TypeError, ValueError):
             self.tcp_port = DEFAULT_TCP_PORT
 
+        # Relay (for reaching this host over the internet through a public relay
+        # server when direct/UPnP/port-forward isn't possible — CGNAT, VPN, etc.).
+        self.relay_addr = database.get_setting("relay_addr", "")
+        self.relay_enabled = database.get_setting("relay_enabled", "") == "1"
+
         self._hostnet = None
         self._discovery = None
+        self._relay_agent = None
 
     # --- identity ---
     def set_name(self, name):
@@ -636,6 +821,58 @@ class NetController:
         starts, since the server binds the port at start."""
         self.tcp_port = int(port)
         self._db.set_setting("net_host_port", str(int(port)))
+
+    @property
+    def media_port(self):
+        """Port for the remote screen view/control stream (control port + 1)."""
+        return self.tcp_port + 1
+
+    @property
+    def audio_port(self):
+        """Port for the live meeting-audio stream (control port + 2)."""
+        return self.tcp_port + 2
+
+    def map_extra_port(self, port, protocol="TCP"):
+        """Best-effort UPnP-open another port (e.g. the UDP media port) on the router."""
+        threading.Thread(target=self._try_upnp, args=(int(port), protocol),
+                         daemon=True).start()
+
+    # --- relay (internet reachability without port-forwarding) ---
+    def set_relay_addr(self, addr):
+        """Persist the relay server address ('host:port' or 'host')."""
+        self.relay_addr = (addr or "").strip()
+        self._db.set_setting("relay_addr", self.relay_addr)
+
+    def set_relay_enabled(self, enabled):
+        """Turn relay reachability on/off (persisted) and start/stop the agent live."""
+        self.relay_enabled = bool(enabled)
+        self._db.set_setting("relay_enabled", "1" if self.relay_enabled else "0")
+        if self.relay_enabled:
+            self.start_relay()
+        else:
+            self.stop_relay()
+
+    def start_relay(self):
+        """Park outbound connections at the relay so viewers can reach this host by
+        its ID. No-op if disabled, unconfigured, or already running. The local
+        control + screen servers must already be listening (they open at app start)."""
+        if self._relay_agent is not None or not self.relay_enabled:
+            return
+        from services.relaylink import RelayAgent, parse_addr
+        host, port = parse_addr(self.relay_addr)
+        if not host:
+            get_logger().warning("relay: enabled but no relay address set")
+            return
+        agent = RelayAgent(host, port, self.host_id,
+                           {"control": self.tcp_port, "screen": self.media_port,
+                            "audio": self.audio_port})
+        agent.start()
+        self._relay_agent = agent
+
+    def stop_relay(self):
+        if self._relay_agent is not None:
+            self._relay_agent.stop()
+            self._relay_agent = None
 
     def local_ip(self):
         return local_ip()
@@ -653,7 +890,10 @@ class NetController:
         host can be reached from the internet with no manual port-forwarding."""
         if self._hostnet is not None:
             return None
-        hostnet = _HostNet(self.name, self.host_id, self.tcp_port, on_approve)
+        approved = self._db.get_approved_peers()
+        hostnet = _HostNet(self.name, self.host_id, self.tcp_port, on_approve,
+                           approved=approved,
+                           on_approved_change=self._db.set_approved_peers)
         try:
             hostnet.start()
         except OSError as exc:
@@ -664,22 +904,24 @@ class NetController:
                          daemon=True).start()
         return None
 
-    def _try_upnp(self, port):
+    def _try_upnp(self, port, protocol="TCP"):
         """Best-effort automatic router port-opening (runs off the GUI thread)."""
         try:
             from services import upnp
-            external_ip, err = upnp.add_port_mapping(port, local_ip())
+            external_ip, err = upnp.add_port_mapping(port, local_ip(), protocol=protocol)
         except Exception:
             get_logger().exception("upnp: mapping attempt crashed")
             return
         if err:
             get_logger().warning(
-                "upnp: could NOT auto-open port %d (%s). Viewers on the internet "
-                "won't reach this host until you port-forward TCP %d to this PC on "
-                "the router, or enable UPnP on the router.", port, err, port)
+                "upnp: could NOT auto-open %s port %d (%s). Viewers on the internet "
+                "won't reach this host until you port-forward %s %d to this PC on "
+                "the router, or enable UPnP on the router.", protocol, port, err,
+                protocol, port)
         else:
             where = f" -> reachable at {external_ip}:{port}" if external_ip else ""
-            get_logger().info("upnp: opened router port %d automatically%s", port, where)
+            get_logger().info("upnp: opened router %s port %d automatically%s",
+                              protocol, port, where)
 
     def stop_hosting(self):
         if self._hostnet is not None:
@@ -722,6 +964,7 @@ class NetController:
         return self._discovery.peers() if self._discovery is not None else []
 
     def shutdown(self):
+        self.stop_relay()
         self.stop_hosting()
         if self._discovery is not None:
             self._discovery.stop()

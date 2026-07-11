@@ -7,5 +7,10 @@ PySide6
 pypdf
 python-docx
 
+# Remote screen view/control
+av         # PyAV: H.264 encode/decode for the screen stream
+mss        # screen capture (multi-monitor)
+dxcam      # optional faster DXGI capture on Windows (falls back to mss)
+
 # Build only (used by build.ps1 to produce IronStack.exe)
 pyinstaller

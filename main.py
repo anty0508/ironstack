@@ -101,9 +101,9 @@ class ConnectionApprover(QtCore.QObject):
 
     _requested = QtCore.Signal(object)   # carries a pending {peer, event, result} dict
 
-    def __init__(self, parent_window):
+    def __init__(self, on_accepted=None):
         super().__init__()
-        self._parent_window = parent_window
+        self._on_accepted = on_accepted
         self._requested.connect(self._on_requested)
 
     def approve(self, peer):
@@ -121,17 +121,18 @@ class ConnectionApprover(QtCore.QObject):
         name = peer.get("name", "A viewer")
         ip = peer.get("ip", "?")
         try:
+            # Parent to whatever window is active now (setup or interview), since
+            # the server accepts connections for the whole app run.
             dlg = MessageDialog(
                 "Viewer wants to connect",
-                f"“{name}” ({ip}) wants to view this live meeting.\n\n"
+                f"“{name}” ({ip}) wants to connect to this machine.\n\n"
                 "Allow the connection?",
-                parent=self._parent_window,
+                parent=QtWidgets.QApplication.activeWindow(),
                 confirm_text="Accept", cancel_text="Reject")
             pending["result"] = dlg.exec() == QtWidgets.QDialog.Accepted
-            if pending["result"]:
-                # A viewer is now connected -> open the shared notepad on the host.
+            if pending["result"] and self._on_accepted is not None:
                 try:
-                    self._parent_window.set_connected(True)
+                    self._on_accepted()
                 except Exception:
                     pass
         except Exception:
@@ -141,8 +142,172 @@ class ConnectionApprover(QtCore.QObject):
             pending["event"].set()
 
 
+class HostSession:
+    """Owns the host's network servers for the whole app run.
+
+    The control + media sockets open at app START (not per-interview), so this PC
+    is discoverable/reachable and can be remote-controlled from launch. An
+    interview just registers its overlay/console here so transcript data flows to
+    already-connected viewers; ending it clears that registration but leaves the
+    sockets open."""
+
+    def __init__(self, net):
+        self.net = net
+        self.approver = ConnectionApprover(on_accepted=self._on_viewer_accepted)
+        self.overlay = None
+        self.console = None
+        self.on_refresh = None
+        self.on_language = None
+        self._remote = None            # RemoteScreenServer (TCP)
+        self.remote_injector = None    # InputInjector for the shared monitor
+        self._audio = None             # AudioServer (TCP) — live meeting audio
+
+    # --- lifecycle ---
+    def start(self):
+        """Open the control server + beacon (+ UPnP) and the TCP screen server."""
+        err = self.net.start_hosting(on_approve=self.approver.approve)
+        if err:
+            get_logger().warning("hosting unavailable at startup: %s", err)
+            return
+        if self.net.server is not None:
+            self.net.server.on_message = self._dispatch
+        self._start_remote()
+        self._start_audio()
+        # If relay reachability is enabled, park outbound connections at the relay
+        # so viewers can reach this host by its ID over the internet (CGNAT-proof).
+        self.net.start_relay()
+
+    def _start_remote(self):
+        if self._remote is not None:
+            return
+        try:
+            import secrets
+            from services.remote import RemoteScreenServer
+            from services.inputinject import InputInjector
+
+            def on_session(geometry):
+                # Viewer chose a monitor -> injector for it, so input (arriving
+                # over the reliable TCP control channel) maps to that display.
+                self.remote_injector = InputInjector(*geometry)
+
+            srv = RemoteScreenServer(self.net.media_port, secrets.token_hex(8),
+                                     on_session=on_session)
+            srv.start()
+            self._remote = srv
+            self.net.map_extra_port(self.net.media_port, protocol="TCP")
+        except Exception:
+            get_logger().exception("remote: screen server failed to start")
+
+    def _start_audio(self):
+        if self._audio is not None:
+            return
+        try:
+            import secrets
+            from services.audiostream import AudioServer
+            srv = AudioServer(self.net.audio_port, secrets.token_hex(8))
+            srv.start()
+            self._audio = srv
+            self.net.map_extra_port(self.net.audio_port, protocol="TCP")
+        except Exception:
+            get_logger().exception("audio: server failed to start")
+
+    def stop(self):
+        if self._remote is not None:
+            self._remote.stop()
+        if self._audio is not None:
+            self._audio.stop()
+        self.net.stop_hosting()
+
+    # --- interview registration ---
+    def begin_interview(self, overlay, console, on_refresh, on_language):
+        self.overlay = overlay
+        self.console = console
+        self.on_refresh = on_refresh
+        self.on_language = on_language
+
+    def end_interview(self):
+        self.overlay = self.console = self.on_refresh = self.on_language = None
+
+    # --- callbacks ---
+    def _on_viewer_accepted(self):
+        if self.overlay is not None:
+            try:
+                self.overlay.set_connected(True)   # open the shared notepad
+            except Exception:
+                pass
+
+    def _offer_remote(self):
+        # A viewer asked to view/control -> rotate the token and offer the media
+        # port + monitor list over the control channel; the viewer connects the
+        # TCP screen socket, and input flows back over this control channel.
+        self._start_remote()
+        if self._remote is None:
+            return
+        import secrets
+        from services import screencap
+        token = secrets.token_hex(8)
+        self._remote.token = token
+        try:
+            monitors = screencap.enumerate_monitors()
+        except Exception:
+            monitors = [{"id": 1, "name": "Display 1"}]
+        self.net.send({"type": "remote_offer", "media_port": self.net.media_port,
+                       "token": token, "monitors": monitors})
+        get_logger().info("remote: offered screen to viewer (media port %d)",
+                          self.net.media_port)
+
+    def _offer_audio(self):
+        # A viewer wants to hear the meeting -> rotate the audio token and offer
+        # the audio port; the viewer connects the audio socket and plays the mix.
+        self._start_audio()
+        if self._audio is None:
+            return
+        import secrets
+        token = secrets.token_hex(8)
+        self._audio.token = token
+        self.net.send({"type": "audio_offer", "audio_port": self.net.audio_port,
+                       "token": token})
+        get_logger().info("audio: offered stream to viewer (audio port %d)",
+                          self.net.audio_port)
+
+    def _dispatch(self, msg):
+        """Host-side handler for messages a viewer sends back (runs for the whole
+        app run, not just during an interview)."""
+        t = msg.get("type")
+        if t == "cmd":
+            action = msg.get("action")
+            if action == "stealth":
+                get_window_visibility_controller().set_capture_excluded(
+                    bool(msg.get("value")))
+            elif action == "refresh" and self.on_refresh is not None:
+                self.on_refresh()
+            elif action == "language":
+                if self.overlay is not None:
+                    self.overlay.set_language(msg.get("code"), msg.get("name", ""))
+                if self.on_language is not None:
+                    self.on_language(msg.get("code"), msg.get("name", ""))
+            elif action == "remote_start":
+                self._offer_remote()
+            elif action == "remote_kf":
+                if self._remote is not None:
+                    self._remote.request_keyframe()
+            elif action == "audio_start":
+                self._offer_audio()
+            return
+        if t == "input":
+            # Remote-control input over the reliable TCP control channel -> inject
+            # on the shared monitor (dropped until a session set up the injector).
+            inj = self.remote_injector
+            if inj is not None:
+                inj.apply(msg)
+            return
+        if t == "shared_text" and self.overlay is not None:
+            self.overlay.set_shared_text(msg.get("text", ""))
+
+
 def _run_interview(app, tray, system_prompt, meeting_id, start_geometry=None,
-                   language_code="en", language_name="English", net=None):
+                   language_code="en", language_name="English", net=None,
+                   host_session=None):
     """Run one interview session against a fresh overlay window.
 
     Blocks on a nested event loop until the user ends the meeting or quits the
@@ -162,19 +327,9 @@ def _run_interview(app, tray, system_prompt, meeting_id, start_geometry=None,
     if tray is not None:
         tray.set_window(overlay)
 
-    # Starting an interview automatically makes this PC a Host: open the server +
-    # beacon so Viewers can find it. Each viewer that connects is approved by the
-    # host through a dialog (ConnectionApprover). If the port is taken (another
-    # host already running on this PC) we just run without networking.
-    approver = ConnectionApprover(overlay)
-    if net is not None:
-        host_err = net.start_hosting(on_approve=approver.approve)
-        if host_err:
-            get_logger().warning("hosting unavailable: %s", host_err)
-            overlay.info("[network] hosting unavailable (another host on this PC?)")
-
-    # Everything the transcriber/answerer displays goes through this console. It
-    # updates the local overlay and, when hosting, mirrors each call to Viewers.
+    # The host servers are already open (opened at app launch by HostSession).
+    # This meeting just streams its data to whoever is connected: the console
+    # updates the local overlay and mirrors each call to connected Viewers.
     console = Broadcaster(overlay, server=net.server if net is not None else None)
     if net is not None:
         net.set_in_meeting(True)
@@ -254,11 +409,13 @@ def _run_interview(app, tray, system_prompt, meeting_id, start_geometry=None,
 
     overlay.language_changed.connect(on_language_changed)
 
-    # A viewer changing language (or refresh/stealth) arrives here; apply the
-    # language to the host pipeline and reflect it on the host's own picker.
-    if net is not None and net.server is not None:
-        net.server.on_message = lambda msg: _handle_message(
-            overlay, msg, on_refresh=restart_transcription, on_language=apply_language)
+    # Register this meeting with the always-on host session, so viewer messages
+    # (refresh / language / shared note) reach this overlay and pipeline. Remote
+    # control, stealth and connection approval are handled by the session
+    # regardless of whether an interview is running.
+    if host_session is not None:
+        host_session.begin_interview(overlay, console, restart_transcription,
+                                     apply_language)
 
     # Each transcriber runs its own asyncio loop on a background thread so the Qt
     # event loop owns the main thread.
@@ -309,10 +466,11 @@ def _run_interview(app, tray, system_prompt, meeting_id, start_geometry=None,
     stop.set()
     transcriber.stop()
     mic_transcriber.stop()
+    if host_session is not None:
+        host_session.end_interview()   # servers stay open; just unregister
     if net is not None:
         console.meeting_end()
         net.set_in_meeting(False)
-        net.stop_hosting()   # hosting lives only for the duration of the meeting
     overlay.shutdown()
     overlay.close()
     app.processEvents()   # let the window actually disappear before setup reopens
@@ -323,16 +481,10 @@ def _run_interview(app, tray, system_prompt, meeting_id, start_geometry=None,
 
 
 def _handle_message(overlay, msg, on_refresh=None, on_language=None):
-    """Dispatch a received network message. Remote-control commands ('cmd') are
-    handled here; everything else is a display update replayed onto the overlay.
-
-    - stealth: apply the capture-exclusion state locally (so host and viewers
-      stay in sync). Setting it via the controller does not re-emit, so there is
-      no feedback loop.
-    - refresh: restart transcription (host only; viewers have none).
-    - language: reflect the new language on the local picker, and (host only)
-      apply it to the live pipeline. Updating the picker is done with signals
-      blocked, so it does not bounce back out."""
+    """Viewer-side dispatch of a received message. Commands the host relays
+    (stealth / language) are reflected locally; everything else is a display
+    update replayed onto the overlay. (Host-side handling lives in
+    HostSession._dispatch.)"""
     if msg.get("type") == "cmd":
         action = msg.get("action")
         if action == "stealth":
@@ -349,6 +501,12 @@ def _handle_message(overlay, msg, on_refresh=None, on_language=None):
     apply_message(overlay, msg)
 
 
+class _RemoteBridge(QtCore.QObject):
+    """Marshals a remote-control offer from the network receive thread to the GUI
+    thread, where the remote-desktop window must be created."""
+    offer = QtCore.Signal(object)
+
+
 def _run_viewer(app, tray, net, target, start_geometry=None):
     """Run as a Viewer: open an overlay and drive it from a Host's stream.
 
@@ -356,15 +514,69 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
     the Host's meeting. Blocks until the user ends/quits; returns True to go back
     to setup, False to quit the app.
     """
-    host, port = target
     log = get_logger()
-    log.info("viewer connecting to %s:%s", host, port)
+
+    # target: {"mode":"relay","relay_host":h,"relay_port":p,"room":<host id>}.
+    # The viewer reaches the host through the relay by ID — no direct connection.
+    from services import relaylink
+    rhost, rport, room = target["relay_host"], target["relay_port"], target["room"]
+    host, port = room, 0     # placeholders; the dialers below do the connecting
+    control_dialer = lambda: relaylink.dial_via_relay(rhost, rport, room, "control")
+    screen_connect = lambda: relaylink.dial_via_relay(rhost, rport, room, "screen")
+    where = f"id {room} via relay {rhost}:{rport}"
+    log.info("viewer connecting to %s", where)
 
     overlay = Overlay(start_geometry=start_geometry, role="viewer")
     overlay.show()
     if tray is not None:
         tray.set_window(overlay)
-    overlay.info(f"[viewer] connecting to {host}:{port} — waiting for host to accept…")
+    overlay.info(f"[viewer] connecting to {where} — waiting for host to accept…")
+
+    # Remote-desktop windows this viewer has open (kept referenced so they live).
+    remote_windows = []
+    remote_bridge = _RemoteBridge()
+
+    # Live meeting audio played on this PC's speakers (one client, re-offered on
+    # each (re)connect so it always uses a fresh token).
+    audio = {"client": None}
+
+    def open_audio(msg):
+        try:
+            from services.audiostream import AudioClient
+            if audio["client"] is not None:
+                audio["client"].stop()
+            ac = AudioClient(
+                room, 0, msg.get("token"),
+                connect=lambda: relaylink.dial_via_relay(rhost, rport, room, "audio"),
+                on_status=lambda s: get_logger().info("viewer audio: %s", s))
+            ac.start()
+            audio["client"] = ac
+        except Exception:
+            get_logger().exception("audio: could not start playback (deps missing?)")
+
+    def open_remote(msg):
+        # GUI thread: open the remote-desktop window for the host's offer. Guard
+        # the whole thing so a missing dep (e.g. PyAV) shows a message, not a crash.
+        try:
+            from ui.remoteview import RemoteView
+            monitors = msg.get("monitors") or [{"id": 1, "name": "Display 1"}]
+            rv = RemoteView(
+                host, msg.get("media_port"), msg.get("token"),
+                monitors, monitors[0].get("id", 1),
+                # Input rides the reliable control channel; screen is its own socket
+                # (direct to host:media_port, or dialed through the relay).
+                send_input=lambda ev: client.send({"type": "input", **ev}),
+                connect_screen=screen_connect)
+        except Exception:
+            get_logger().exception("remote: could not open view (deps missing?)")
+            overlay.info("[remote] unavailable (missing components — reinstall requirements)")
+            return
+        rv.closed.connect(lambda: remote_windows.remove(rv) if rv in remote_windows else None)
+        remote_windows.append(rv)
+        rv.show()
+        rv.raise_()
+
+    remote_bridge.offer.connect(open_remote)
 
     # Received messages replay onto the overlay; overlay methods are thread-safe.
     def on_message(msg):
@@ -373,6 +585,12 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
             overlay.info("[host ended the meeting]")
             overlay.end_meeting.emit()
             return
+        if msg.get("type") == "remote_offer":
+            remote_bridge.offer.emit(msg)   # -> GUI thread opens the window
+            return
+        if msg.get("type") == "audio_offer":
+            open_audio(msg)                 # start/replace speaker playback
+            return
         _handle_message(overlay, msg)
 
     def on_status(text):
@@ -380,13 +598,17 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
         overlay.info(f"[viewer] {text}")
         if text.startswith("connected"):
             overlay.set_connected(True)   # host accepted -> open the shared notepad
-        elif "host closed" in text:
-            overlay.end_meeting.emit()    # host disappeared -> end the viewer too
+            client.send({"type": "cmd", "action": "audio_start"})   # hear the meeting
+        # A dropped link no longer ends the session — NetClient reconnects on its
+        # own (slow/lossy networks). Only "host ended the meeting" (a meeting_end
+        # message) or the user closing the window ends the viewer.
 
     client = NetClient(
         host, port, name=net.name if net is not None else "viewer",
         on_message=on_message,
         on_status=on_status,
+        dialer=control_dialer,
+        viewer_id=net.host_id if net is not None else "",
     )
     client.start()
     # Shared notepad: the viewer's local edits go back to the host.
@@ -407,6 +629,10 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
     overlay.language_changed.connect(
         lambda code, name: client.send(
             {"type": "cmd", "action": "language", "code": code, "name": name}))
+    # Remote control: ask the host to share its screen; the offer comes back as a
+    # "remote_offer" message which opens the remote-desktop window.
+    overlay.remote_requested.connect(
+        lambda: client.send({"type": "cmd", "action": "remote_start"}))
 
     loop = QtCore.QEventLoop()
     state = {"quit": False}
@@ -421,6 +647,13 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
         tray.set_quit_handler(on_quit)
     loop.exec()
 
+    for rv in list(remote_windows):
+        try:
+            rv.close()
+        except Exception:
+            pass
+    if audio["client"] is not None:
+        audio["client"].stop()
     client.stop()
     overlay.shutdown()
     overlay.close()
@@ -496,6 +729,18 @@ def main():
     # whole session, so a host keeps running across the setup <-> meeting loop.
     net = NetController(database)
 
+    # Create the window-visibility controller now, on the GUI thread, so its Qt
+    # thread affinity is correct. A viewer that connects and toggles stealth is
+    # handled on a network thread; the controller marshals that back to the GUI
+    # thread, but only if it was itself created here rather than there.
+    get_window_visibility_controller()
+
+    # Open the host servers NOW (at app start, not per-interview): the control +
+    # media sockets, beacon and UPnP mapping come up immediately, so this PC is
+    # discoverable, connectable and remote-controllable from launch.
+    host_session = HostSession(net)
+    host_session.start()
+
     # The windows are kept off the taskbar; the tray icon is how the user gets
     # to the app. Only hide from the taskbar if a tray is actually available,
     # so the windows can never become unreachable.
@@ -533,9 +778,10 @@ def main():
                               launcher.meeting_id, start_geometry,
                               language_code=launcher.language_code,
                               language_name=launcher.language_name,
-                              net=net):
+                              net=net, host_session=host_session):
             break   # user chose Quit during the interview
 
+    host_session.stop()
     net.shutdown()
     if tray is not None:
         tray.hide()

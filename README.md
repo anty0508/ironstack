@@ -35,6 +35,10 @@ services/      Live answering pipeline
   netlink.py     Discovery + Host↔Viewer streaming of the live meeting (TCP/UDP).
   upnp.py        Best-effort automatic router port-opening (UPnP) so the host is
                  reachable over the internet without manual port-forwarding.
+  remote.py      Remote screen stream over TCP (drop-at-source, NODELAY, ~720p).
+  vcodec.py      H.264 encode/decode (PyAV, hardware-preferred).
+  screencap.py   Monitor enumeration + capture (dxcam fast path, mss fallback).
+  inputinject.py Win32 SendInput — mouse/keyboard injection on the Host.
 
 storage/       Data
   database.py    SQLite: documents, meetings, transcripts, settings.
@@ -93,10 +97,13 @@ feature is the workaround: run the meeting on the watched/remote machine (the
   interviewer questions, the candidate's spoken answers ("You"), and the AI answer.
   The candidate's talking is shown only on Viewers, not on the Host.
 
-**Hosting is automatic.** When you Start an interview, that PC becomes a Host and
-appears to Viewers — no host switch, no pairing code. Each Viewer that connects
-pops an **Accept / Reject** dialog on the Host; the stream flows only once the
-Host accepts. (The Viewer window has a blue brand dot to tell it from the Host.)
+**The host servers open at app start** (a `HostSession` owns the control + media
+sockets, beacon and UPnP for the whole app run) — so the PC is discoverable,
+connectable and remote-controllable from launch, no host switch, no pairing code.
+A Viewer can connect during setup and stays connected when the interview starts.
+Each Viewer that connects pops an **Accept / Reject** dialog on the Host; the
+stream flows only once the Host accepts. (The Viewer window has a blue brand dot
+to tell it from the Host.)
 
 Also over the wire (both directions): a **shared note** panel (a live two-way
 notepad), and **remote control** — toggling **Stealth**, hitting **⟳ Restart
@@ -107,20 +114,97 @@ its IP/port (`127.0.0.1` : `48921` for same-PC testing; the last address is
 remembered) — and click *Join as Viewer*. Only text is sent over the wire, never
 audio.
 
-### Over the internet
-Auto-discovery only works on the same LAN. To reach a Host across the internet it
-must be reachable inbound, which residential NAT normally blocks. Options:
+### Over the internet — connect by ID through a relay
+Reaching a Host directly across the internet needs it to be reachable inbound,
+which residential NAT/CGNAT/VPNs normally block. Instead, IronStack connects **by
+ID through a relay server** you run once on any machine with a public IP (a $5 VPS,
+an EC2 box, etc.). Both the Host and the Viewer make **outbound** connections to
+the relay — which always work, even behind CGNAT or a VPN — and the relay pairs
+them by ID and pipes the bytes.
 
-- **UPnP (automatic).** On Start, the Host asks the router to open its port via
-  UPnP ([upnp.py](services/upnp.py)); if the router allows it, Viewers can connect
-  to the Host's public IP + port with no manual setup. The console logs whether it
-  succeeded.
-- **Manual port-forward.** Forward TCP `48921` (or your chosen port) on the Host's
-  router to the Host PC — only works if the ISP isn't using CGNAT.
-- **Tunnel** (Tailscale/ngrok) if UPnP is off and port-forwarding isn't possible.
+**1. Run the relay** on your public box (Python 3, no dependencies):
 
-The Host's **listen port** is configurable in the Network page, so it can match a
-VPN/router forwarded port.
+```bash
+python3 relay_server.py            # listens on 0.0.0.0:48920
+```
+
+Open that **TCP port (48920)** in the OS firewall and, on a cloud VM, the Security
+Group. It's a generic byte-pipe — it carries both the meeting-control channel and
+the remote-screen channel, and multiplexes any number of rooms.
+
+**2. On the Host:** open **Network**, set the **Relay server** to your box
+(`host:port`, e.g. `54.254.60.12:48920`), tick **"Make this PC reachable by ID"**,
+and share **Your connection ID** (shown on the page).
+
+**3. On the Viewer:** open **Network**, set the same **Relay server**, type the
+Host's **connection ID**, and click **Join as Viewer**.
+
+No port-forwarding, no UPnP, no public Host IP — it works through CGNAT and
+alongside a VPN. The relay ([relay_server.py](relay_server.py)) keeps a small pool
+of parked Host connections ([relaylink.py](services/relaylink.py)) and heartbeats
+them so the NAT mapping stays open; each Viewer that joins claims one and the Host
+opens a replacement. Everything on top — transcript, notes, remote screen/control —
+rides through unchanged.
+
+> Latency note: traffic goes Host → relay → Viewer, so place the relay sensibly
+> (near one end, or on the path between them) to minimise the detour.
+
+The LAN UDP discovery beacon ([netlink.py](services/netlink.py)) and automatic
+UPnP port-opening ([upnp.py](services/upnp.py)) still run for same-network use, but
+the relay is the reliable path over the internet.
+
+### Remote screen view / control
+Once connected, the Viewer clicks **Remote** to view and control the Host's screen
+(like AnyDesk). It uses **two TCP sockets**, split by need:
+
+- **Screen → its own TCP socket** (`media_port` = control port + 1, UPnP-opened).
+  The chosen monitor is captured ([screencap.py](services/screencap.py): dxcam
+  fast path, mss fallback), H.264-encoded ([vcodec.py](services/vcodec.py),
+  hardware-preferred, ~720p), and streamed. TCP is *reliable* — no skipped/garbled
+  frames — and latency is kept low by **drop-at-source** (the capture loop blocks
+  on send, then grabs a fresh frame, so nothing queues and fps adapts to the
+  link), **`TCP_NODELAY`**, and a small send buffer.
+- **Input → the netlink control channel** (the other socket). Mouse/keyboard
+  events (normalized monitor coords) ride the reliable, video-free channel — never
+  dropped, never stuck behind a frame — and are injected on the Host via Win32
+  `SendInput` ([inputinject.py](services/inputinject.py)).
+
+Keyboard uses a global low-level hook ([keyhook.py](services/keyhook.py)) while the
+remote window is focused, so **all** keys and combos reach the host — Ctrl+C/V, the
+Windows key, function keys — not just what Qt would pass through. Alt+Tab is left
+local so you can always switch away.
+
+The screen socket is guarded by a one-time **token** issued over the already-
+accepted control channel (no extra prompt). The Viewer window is a floating
+RDP/VMware-style toolbar (drag left/right) with a **monitor picker**, a **quality**
+selector (Low/Medium/High — up to full 1080p), **fullscreen** (Esc exits), and a
+**View only** toggle. The Host shows nothing about the sharing.
+
+The Host also sends its current **cursor shape** (I-beam over text, hand over
+links, wait/busy, …) so the Viewer's pointer matches what the Host is doing.
+
+When connected **by ID through the relay**, the screen rides the relay's separate
+"screen" channel automatically — no second port to open, nothing extra to forward.
+On a direct LAN connection it's plain TCP to `media_port`, so the Host must be
+reachable there too (UPnP, or the same port-forward as the control port).
+
+### Live meeting audio
+As soon as a Viewer connects, it also **hears the meeting**: the Host captures both
+its **system output** (loopback — the interviewer's voice) and its **microphone**
+(the candidate's voice), mixes them, and streams the mix to the Viewer, which plays
+it on its own speakers ([audiostream.py](services/audiostream.py)). It uses a third
+dedicated socket (`audio_port` = control port + 2; the relay's "audio" channel over
+the internet). The payload is raw PCM (mono, 24 kHz) with drop-oldest buffering, so
+a slow link causes brief drop-outs rather than growing delay. Capture runs only
+while a Viewer is listening. Only text and this audio mix cross the wire — never
+the raw microphone/loopback device streams.
+
+**Elevated windows.** A non-elevated app can't inject input into elevated/admin
+windows (Windows UIPI) — so some modals (e.g. AnyDesk's Accept dialog, other
+admin apps) can't be clicked. The build **requests UAC elevation at launch** (one
+exe for both roles: the Viewer just accepts the prompt, the Host runs elevated so
+it can control admin-level windows). The **UAC secure desktop** itself and
+**Ctrl+Alt+Delete** still can't be reached without a SYSTEM service (a later phase).
 
 ## Build a standalone .exe
 

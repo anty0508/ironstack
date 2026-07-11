@@ -105,8 +105,9 @@ def _soap(control_url, service_type, action, args_xml):
         return resp.read().decode("utf-8", "ignore")
 
 
-def add_port_mapping(port, internal_ip, description="IronStack"):
-    """Ask the router to forward external TCP `port` -> `internal_ip:port`.
+def add_port_mapping(port, internal_ip, description="IronStack", protocol="TCP"):
+    """Ask the router to forward external `port` -> `internal_ip:port` for the
+    given protocol ("TCP" or "UDP").
 
     Returns (external_ip, None) on success, or (None, error_message) on failure.
     """
@@ -121,7 +122,7 @@ def add_port_mapping(port, internal_ip, description="IronStack"):
     args = (
         "<NewRemoteHost></NewRemoteHost>"
         f"<NewExternalPort>{int(port)}</NewExternalPort>"
-        "<NewProtocol>TCP</NewProtocol>"
+        f"<NewProtocol>{protocol}</NewProtocol>"
         f"<NewInternalPort>{int(port)}</NewInternalPort>"
         f"<NewInternalClient>{internal_ip}</NewInternalClient>"
         "<NewEnabled>1</NewEnabled>"
@@ -147,7 +148,7 @@ def add_port_mapping(port, internal_ip, description="IronStack"):
     return external_ip, None
 
 
-def delete_port_mapping(port):
+def delete_port_mapping(port, protocol="TCP"):
     """Remove a mapping previously added with add_port_mapping (best-effort)."""
     desc_url = _discover_igd()
     if not desc_url:
@@ -158,7 +159,7 @@ def delete_port_mapping(port):
     args = (
         "<NewRemoteHost></NewRemoteHost>"
         f"<NewExternalPort>{int(port)}</NewExternalPort>"
-        "<NewProtocol>TCP</NewProtocol>"
+        f"<NewProtocol>{protocol}</NewProtocol>"
     )
     try:
         _soap(control_url, service_type, "DeletePortMapping", args)

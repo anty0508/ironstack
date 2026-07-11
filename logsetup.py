@@ -9,6 +9,7 @@ main thread and on worker threads — always reach the log instead of vanishing.
 import logging
 import sys
 import threading
+import faulthandler
 
 _NAME = "ironstack"
 _configured = False
@@ -31,6 +32,15 @@ def setup_logging():
         logger.setLevel(logging.INFO)
         logger.addHandler(handler)
         logger.propagate = False
+    except Exception:
+        pass
+
+    # Dump a C-level traceback on a hard crash (segfault / access violation /
+    # abort) — e.g. a Qt call from the wrong thread — instead of the process just
+    # vanishing. Writes to the console (visible in the -Debug build).
+    try:
+        if sys.stderr is not None:
+            faulthandler.enable()
     except Exception:
         pass
 

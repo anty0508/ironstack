@@ -20,7 +20,7 @@ from storage import documents
 from services.context import build_prompt_from_documents
 from config import LANGUAGES, DEFAULT_LANGUAGE_CODE, language_name
 from logsetup import get_logger
-from ui.overlay import Overlay, apply_exclude_from_capture, get_window_visibility_controller  # for _format_answer in the transcript viewer
+from ui.overlay import Overlay, apply_exclude_from_capture, get_window_visibility_controller, set_window_topmost  # for _format_answer in the transcript viewer
 
 KIND_LABELS = {
     "resume": "Resume",
@@ -401,7 +401,11 @@ class MessageDialog(QtWidgets.QDialog):
     def __init__(self, title, message, parent=None,
                  confirm_text=None, cancel_text="OK", danger=False):
         super().__init__(parent)
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog | Qt.Tool)
+        # WindowStaysOnTopHint so this dialog is never buried under the always-on-
+        # top overlay / setup window (e.g. an incoming-connection approval that the
+        # host must see and click).
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog | Qt.Tool
+                            | Qt.WindowStaysOnTopHint)
         # Opaque (not WA_TranslucentBackground) with square corners so it stays
         # hidden from capture.
         self.setModal(True)
@@ -458,6 +462,15 @@ class MessageDialog(QtWidgets.QDialog):
                   ref.center().y() - self.height() // 2)
         apply_exclude_from_capture(
             self, enabled=get_window_visibility_controller().capture_excluded)
+        # Force it above the always-on-top overlay and give it focus, so the host
+        # can actually see and click it (raise alone loses to a native topmost
+        # window, so also set the native top-most flag).
+        self.raise_()
+        self.activateWindow()
+        try:
+            set_window_topmost(self, True)
+        except Exception:
+            pass
 
 
 def _page(title, hint):
@@ -904,12 +917,7 @@ class Launcher(QtWidgets.QDialog):
     # ---- network page ----
 
     def _build_network_page(self):
-        page, layout = _page(
-            "Network",
-            "Run the meeting on this PC and mirror the live transcript + answers "
-            "to a second IronStack on your own machine (a Viewer). The Host does "
-            "all the work; the Viewer only displays.",
-        )
+        page, layout = _page("Network", "")
 
         if self.net is None:
             note = QtWidgets.QLabel("Networking is unavailable.")
@@ -918,11 +926,20 @@ class Launcher(QtWidgets.QDialog):
             layout.addStretch(1)
             return page
 
+        # Each setting is one line: [label] [field ....] [button], with a fixed
+        # label width so the three fields line up vertically.
+        LBLW = 155
+
+        def _row(label_text):
+            row = QtWidgets.QHBoxLayout()
+            lbl = QtWidgets.QLabel(label_text)
+            lbl.setObjectName("fieldLabel")
+            lbl.setFixedWidth(LBLW)
+            row.addWidget(lbl)
+            return row
+
         # --- this instance's name ---
-        name_lbl = QtWidgets.QLabel("THIS DEVICE'S NAME")
-        name_lbl.setObjectName("fieldLabel")
-        layout.addWidget(name_lbl)
-        name_row = QtWidgets.QHBoxLayout()
+        name_row = _row("THIS DEVICE'S NAME")
         self.name_edit = QtWidgets.QLineEdit(self.net.name)
         self.name_edit.setPlaceholderText("e.g. Home-PC")
         save_name = QtWidgets.QPushButton("Save name")
@@ -932,145 +949,166 @@ class Launcher(QtWidgets.QDialog):
         name_row.addWidget(save_name)
         layout.addLayout(name_row)
 
-        layout.addSpacing(10)
+        # --- this device's connection ID (others connect to you with this) ---
+        id_row = _row("YOUR CONNECTION ID")
+        self.my_id_edit = QtWidgets.QLineEdit(self.net.host_id)
+        self.my_id_edit.setReadOnly(True)
+        copy_id = QtWidgets.QPushButton("Copy")
+        copy_id.setObjectName("ghost")
+        copy_id.clicked.connect(self._copy_id)
+        id_row.addWidget(self.my_id_edit, 1)
+        id_row.addWidget(copy_id)
+        layout.addLayout(id_row)
 
-        # --- host section (automatic) ---
-        host_lbl = QtWidgets.QLabel("HOST")
-        host_lbl.setObjectName("fieldLabel")
-        layout.addWidget(host_lbl)
-        host_note = QtWidgets.QLabel(
-            "Hosting is automatic: when you Start an interview, this PC listens on "
-            "the port below and each Viewer that connects asks your permission. "
-            "Set this to the port your VPN/router forwards to this PC (e.g. an "
-            "Astrill port-forwarding port). Takes effect on the next interview.")
-        host_note.setObjectName("pageHint")
-        host_note.setWordWrap(True)
-        layout.addWidget(host_note)
+        # --- relay server (shared by host + viewer) ---
+        relay_row = _row("RELAY SERVER")
+        self.relay_edit = QtWidgets.QLineEdit(self.net.relay_addr)
+        self.relay_edit.setPlaceholderText("e.g. 54.254.60.12:48920")
+        save_relay = QtWidgets.QPushButton("Save")
+        save_relay.setObjectName("ghost")
+        save_relay.clicked.connect(self._save_relay_addr)
+        relay_row.addWidget(self.relay_edit, 1)
+        relay_row.addWidget(save_relay)
+        layout.addLayout(relay_row)
 
-        host_port_row = QtWidgets.QHBoxLayout()
-        hp_lbl = QtWidgets.QLabel("This host listens on port:")
-        hp_lbl.setObjectName("pageHint")
-        self.listen_port_edit = QtWidgets.QLineEdit(str(self.net.tcp_port))
-        self.listen_port_edit.setFixedWidth(90)
-        set_port = QtWidgets.QPushButton("Set")
-        set_port.setObjectName("ghost")
-        set_port.clicked.connect(self._save_listen_port)
-        host_port_row.addWidget(hp_lbl)
-        host_port_row.addWidget(self.listen_port_edit)
-        host_port_row.addWidget(set_port)
-        host_port_row.addStretch(1)
-        layout.addLayout(host_port_row)
+        self.relay_reachable = QtWidgets.QCheckBox(
+            "Make this PC reachable by ID (connect to the relay now)")
+        self.relay_reachable.setChecked(self.net.relay_enabled)
+        self.relay_reachable.toggled.connect(self._toggle_reachable)
+        layout.addWidget(self.relay_reachable)
 
         layout.addSpacing(12)
 
-        # --- viewer section ---
-        join_lbl = QtWidgets.QLabel("VIEWER — JOIN A MEETING")
+        # --- viewer: connect to a host by ID (saved list + entry) ---
+        join_lbl = QtWidgets.QLabel("CONNECT TO A HOST — BY ID")
         join_lbl.setObjectName("fieldLabel")
         layout.addWidget(join_lbl)
 
-        hint = QtWidgets.QLabel("Pick a discovered host, or type its address, then Join.")
-        hint.setObjectName("pageHint")
-        layout.addWidget(hint)
+        # Saved hosts: pick one (fills the ID), Rename to give the opaque id a
+        # friendly name, or double-click to join. Populated as you connect.
+        self.saved_list = QtWidgets.QListWidget()
+        self.saved_list.setObjectName("doclist")
+        self.saved_list.setMinimumHeight(120)
+        self.saved_list.itemSelectionChanged.connect(self._on_saved_selected)
+        self.saved_list.itemDoubleClicked.connect(lambda _=None: self._join_by_id())
+        layout.addWidget(self.saved_list, 1)
 
-        self.hosts_list = QtWidgets.QListWidget()
-        self.hosts_list.setObjectName("doclist")
-        self.hosts_list.setMaximumHeight(140)
-        self.hosts_list.itemSelectionChanged.connect(self._on_host_selected)
-        self.hosts_list.itemDoubleClicked.connect(lambda _=None: self._join_viewer())
-        layout.addWidget(self.hosts_list)
+        saved_btns = QtWidgets.QHBoxLayout()
+        rename_btn = QtWidgets.QPushButton("Rename")
+        rename_btn.setObjectName("ghost")
+        rename_btn.clicked.connect(self._rename_saved)
+        remove_btn = QtWidgets.QPushButton("Remove")
+        remove_btn.setObjectName("ghost")
+        remove_btn.clicked.connect(self._remove_saved)
+        saved_btns.addWidget(rename_btn)
+        saved_btns.addWidget(remove_btn)
+        saved_btns.addStretch(1)
+        layout.addLayout(saved_btns)
 
-        addr_row = QtWidgets.QHBoxLayout()
-        # Remember the last host/port typed, so you don't retype them each time.
-        self.host_ip_edit = QtWidgets.QLineEdit(database.get_setting("viewer_host_ip", ""))
-        self.host_ip_edit.setPlaceholderText("Host IP (e.g. 192.168.1.20 or 127.0.0.1)")
-        self.host_port_edit = QtWidgets.QLineEdit(
-            database.get_setting("viewer_host_port", ""))
-        self.host_port_edit.setPlaceholderText("Port")
-        self.host_port_edit.setFixedWidth(80)
-        addr_row.addWidget(self.host_ip_edit, 1)
-        addr_row.addWidget(self.host_port_edit)
-        layout.addLayout(addr_row)
+        self.peer_id_edit = QtWidgets.QLineEdit(
+            database.get_setting("viewer_peer_id", ""))
+        self.peer_id_edit.setPlaceholderText("Host's connection ID")
+        self.peer_id_edit.returnPressed.connect(self._join_by_id)
+        layout.addWidget(self.peer_id_edit)
 
         join_row = QtWidgets.QHBoxLayout()
         join_row.addStretch(1)
         join_btn = QtWidgets.QPushButton("Join as Viewer")
         join_btn.setObjectName("primary")
         join_btn.setCursor(Qt.PointingHandCursor)
-        join_btn.clicked.connect(self._join_viewer)
+        join_btn.clicked.connect(self._join_by_id)
         join_row.addWidget(join_btn)
         layout.addLayout(join_row)
 
-        # Start discovery and refresh the host list + status on a timer while the
-        # setup window is open.
-        self.net.start_discovery()
-        self._net_timer = QtCore.QTimer(self)
-        self._net_timer.setInterval(1000)
-        self._net_timer.timeout.connect(self._refresh_network)
-        self._net_timer.start()
-        self._refresh_network()
-
+        self._refresh_saved_hosts()
         return page
 
     def _save_instance_name(self):
         self.net.set_name(self.name_edit.text())
-        self._refresh_network()
 
-    def _save_listen_port(self):
-        try:
-            port = int(self.listen_port_edit.text().strip())
-            if not (1 <= port <= 65535):
-                raise ValueError
-        except ValueError:
-            self._warn("Port must be a number between 1 and 65535.")
-            return
-        self.net.set_tcp_port(port)
-        self._warn(f"Host port set to {port}. It takes effect the next time you "
-                   "Start an interview.")
+    def _copy_id(self):
+        QtWidgets.QApplication.clipboard().setText(self.net.host_id)
 
-    def _on_host_selected(self):
-        item = self.hosts_list.currentItem()
-        if item is None:
-            return
-        peer = item.data(Qt.UserRole)
-        if peer:
-            self.host_ip_edit.setText(peer["ip"])
-            self.host_port_edit.setText(str(peer["tcp_port"]))
-
-    def _refresh_network(self):
-        if self.net is None:
-            return
-        # Discovered hosts (preserve the current selection's address)
-        selected = self.hosts_list.currentItem()
-        sel_key = selected.data(Qt.UserRole)["ip"] + ":" + \
-            str(selected.data(Qt.UserRole)["tcp_port"]) if selected else None
-        self.hosts_list.clear()
-        for peer in self.net.peers():
-            if peer["host_id"] == self.net.host_id:
-                continue   # don't list ourselves
-            meeting = " · in meeting" if peer["in_meeting"] else " · idle"
-            label = f"{peer['name']}  ({peer['ip']}:{peer['tcp_port']}){meeting}"
+    # ---- saved hosts list ----
+    def _refresh_saved_hosts(self):
+        self.saved_list.clear()
+        for h in database.get_saved_hosts():
+            name = h.get("name", "").strip()
+            label = f"{name}  ({h['id']})" if name else h["id"]
             item = QtWidgets.QListWidgetItem(label)
-            item.setData(Qt.UserRole, peer)
-            self.hosts_list.addItem(item)
-            if sel_key == peer["ip"] + ":" + str(peer["tcp_port"]):
-                self.hosts_list.setCurrentItem(item)
+            item.setData(Qt.UserRole, h["id"])
+            self.saved_list.addItem(item)
 
-    def _join_viewer(self):
-        ip = self.host_ip_edit.text().strip()
-        port_text = self.host_port_edit.text().strip()
-        if not ip:
-            self._warn("Enter a host IP (or pick one from the discovered list).")
+    def _selected_saved_id(self):
+        item = self.saved_list.currentItem()
+        return item.data(Qt.UserRole) if item else None
+
+    def _on_saved_selected(self):
+        hid = self._selected_saved_id()
+        if hid:
+            self.peer_id_edit.setText(hid)
+
+    def _rename_saved(self):
+        hid = self._selected_saved_id()
+        if not hid:
+            self._warn("Select a saved host to rename.")
             return
-        try:
-            port = int(port_text) if port_text else self.net.tcp_port
-        except ValueError:
-            self._warn("Port must be a number.")
+        current = next((h.get("name", "") for h in database.get_saved_hosts()
+                        if h["id"] == hid), "")
+        name, ok = QtWidgets.QInputDialog.getText(
+            self, "Rename host", f"Name for {hid}:", text=current)
+        if ok:
+            database.rename_saved_host(hid, name.strip())
+            self._refresh_saved_hosts()
+
+    def _remove_saved(self):
+        hid = self._selected_saved_id()
+        if not hid:
+            self._warn("Select a saved host to remove.")
             return
-        # Persist so they're pre-filled next time.
-        database.set_setting("viewer_host_ip", ip)
-        database.set_setting("viewer_host_port", str(port))
+        database.remove_saved_host(hid)
+        self._refresh_saved_hosts()
+
+    def _save_relay_addr(self):
+        from services.relaylink import parse_addr
+        addr = self.relay_edit.text().strip()
+        if addr and parse_addr(addr)[0] is None:
+            self._warn("Relay address must be host or host:port.")
+            return
+        self.net.set_relay_addr(addr)
+        # If reachability is on, restart the agent so it uses the new address.
+        if self.net.relay_enabled:
+            self.net.stop_relay()
+            self.net.start_relay()
+        self._warn(f"Relay server saved: {addr}" if addr else "Relay server cleared.")
+
+    def _toggle_reachable(self, on):
+        # Save the address first so enabling has somewhere to connect.
+        self.net.set_relay_addr(self.relay_edit.text().strip())
+        if on and not self.net.relay_addr:
+            self._warn("Set the relay server address first.")
+            self.relay_reachable.setChecked(False)
+            return
+        self.net.set_relay_enabled(on)
+
+    def _join_by_id(self):
+        from services.relaylink import parse_addr
+        peer_id = self.peer_id_edit.text().strip()
+        if not peer_id:
+            self._warn("Enter the host's connection ID.")
+            return
+        rhost, rport = parse_addr(self.relay_edit.text())
+        if not rhost:
+            self._warn("Set the relay server address first (host:port).")
+            return
+        # Persist the relay + last peer so they're pre-filled next time, and add
+        # this host to the saved list (keeps any name it already has).
+        self.net.set_relay_addr(self.relay_edit.text().strip())
+        database.set_setting("viewer_peer_id", peer_id)
+        database.add_saved_host(peer_id)
         self.mode = "viewer"
-        self.viewer_target = (ip, port)
+        self.viewer_target = {"mode": "relay", "relay_host": rhost,
+                              "relay_port": rport, "room": peer_id}
         self.accept()
 
     # ---- history page ----

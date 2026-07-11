@@ -4,6 +4,7 @@ Access uses short-lived connections (one per call) so it is safe to call from
 the Qt thread, the answer-worker thread and the transcriber thread.
 """
 
+import json
 import sqlite3
 from contextlib import contextmanager
 
@@ -193,3 +194,62 @@ def set_setting(key, value):
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )
+
+
+# --- network peers (stored as JSON in settings) ---
+
+def get_saved_hosts():
+    """Viewer-side saved hosts to connect to, in display order:
+    [{'id': <host id>, 'name': <friendly name>}, ...]."""
+    raw = get_setting("net_saved_hosts", "")
+    try:
+        data = json.loads(raw) if raw else []
+    except (ValueError, TypeError):
+        return []
+    return [d for d in data if isinstance(d, dict) and d.get("id")]
+
+
+def set_saved_hosts(hosts):
+    set_setting("net_saved_hosts", json.dumps(hosts))
+
+
+def add_saved_host(host_id, name=""):
+    """Add a host id if new (keeping any existing name). Returns the updated list."""
+    host_id = str(host_id or "").strip()
+    if not host_id:
+        return get_saved_hosts()
+    hosts = get_saved_hosts()
+    if not any(h["id"] == host_id for h in hosts):
+        hosts.append({"id": host_id, "name": str(name or "")})
+        set_saved_hosts(hosts)
+    return hosts
+
+
+def rename_saved_host(host_id, name):
+    hosts = get_saved_hosts()
+    for h in hosts:
+        if h["id"] == host_id:
+            h["name"] = str(name or "")
+    set_saved_hosts(hosts)
+    return hosts
+
+
+def remove_saved_host(host_id):
+    hosts = [h for h in get_saved_hosts() if h["id"] != host_id]
+    set_saved_hosts(hosts)
+    return hosts
+
+
+def get_approved_peers():
+    """Host-side approved viewers that skip the Accept dialog on reconnect:
+    {<viewer id>: {'name': <str>, 'ts': <epoch seconds of last activity>}}."""
+    raw = get_setting("net_approved_peers", "")
+    try:
+        data = json.loads(raw) if raw else {}
+    except (ValueError, TypeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def set_approved_peers(peers):
+    set_setting("net_approved_peers", json.dumps(peers))

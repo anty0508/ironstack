@@ -77,7 +77,7 @@ def _is_remote_session():
         return False
 
 
-def apply_exclude_from_capture(widget, enabled=True):
+def apply_exclude_from_capture(widget, enabled=True, quiet=False):
     """Hide a window from Windows screen capture / screen sharing.
 
     Prefers WDA_EXCLUDEFROMCAPTURE (the window is fully invisible to capture),
@@ -85,6 +85,9 @@ def apply_exclude_from_capture(widget, enabled=True):
     flag is rejected, so we fall back to WDA_MONITOR (the window shows up as a
     black box in captures, supported back to Windows 7). Returns True if any
     affinity mode was applied.
+
+    `quiet` downgrades the fallback/failure warnings to debug — used by the
+    periodic re-assertion so it doesn't spam the log every second.
 
     The whole feature relies on Desktop Window Manager (GPU) composition; in
     Remote Desktop sessions / some VMs both modes fail regardless of build."""
@@ -125,18 +128,20 @@ def apply_exclude_from_capture(widget, enabled=True):
 
     ok, mon_err = _apply(WDA_MONITOR, "WDA_MONITOR")
     if ok:
-        log.warning("stealth: WDA_EXCLUDEFROMCAPTURE rejected (err=%d) on Windows build "
-                    "%s; fell back to WDA_MONITOR (window shows as BLACK in captures, "
-                    "not invisible).", excl_err, _windows_build())
+        (log.debug if quiet else log.warning)(
+            "stealth: WDA_EXCLUDEFROMCAPTURE rejected (err=%d) on Windows build "
+            "%s; fell back to WDA_MONITOR (window shows as BLACK in captures, "
+            "not invisible).", excl_err, _windows_build())
         return True
     if ok is None:
         return False
 
-    log.warning("stealth: could NOT hide window from capture "
-                "(build=%s, EXCLUDEFROMCAPTURE err=%d, MONITOR err=%d, remote_session=%s). "
-                "Both modes need GPU/DWM composition; this usually means a Remote Desktop "
-                "session or a VM without it. Screen-sharing will show this window.",
-                _windows_build(), excl_err, mon_err, _is_remote_session())
+    (log.debug if quiet else log.warning)(
+        "stealth: could NOT hide window from capture "
+        "(build=%s, EXCLUDEFROMCAPTURE err=%d, MONITOR err=%d, remote_session=%s). "
+        "Both modes need GPU/DWM composition; this usually means a Remote Desktop "
+        "session or a VM without it. Screen-sharing will show this window.",
+        _windows_build(), excl_err, mon_err, _is_remote_session())
     return False
 
 
@@ -177,10 +182,18 @@ def set_window_topmost(widget, topmost=True):
         return False
 
 
-class WindowVisibilityController:
-    """Shared controller for app-wide opacity and capture-exclusion state."""
+class WindowVisibilityController(QtCore.QObject):
+    """Shared controller for app-wide opacity and capture-exclusion state.
+
+    A QObject so window work marshals onto the GUI thread: `set_capture_excluded`
+    can be called from a network thread (a peer toggling stealth), but touching Qt
+    widgets or native handles off the GUI thread crashes the process, so the
+    request is delivered through a queued signal and applied on the GUI thread."""
+
+    _capture_request = QtCore.Signal(bool)
 
     def __init__(self):
+        super().__init__()
         self.opacity_percent = 95
         self.capture_excluded = False
         self.pinned = True
@@ -188,6 +201,26 @@ class WindowVisibilityController:
         self._active = None       # window Ctrl+Alt+H hides/shows (latest registered)
         self._hotkeys = None
         self._start_hotkeys()
+        # Any-thread -> GUI-thread hop for stealth changes (see class docstring).
+        self._capture_request.connect(self._apply_capture_excluded)
+        # Capture-exclusion (stealth) is a per-HWND flag that Windows silently
+        # drops whenever Qt recreates the native handle (flag changes, some
+        # reconnect/refresh paths). A light watchdog re-asserts it so stealth,
+        # once on, can never quietly turn itself off.
+        self._watchdog = QtCore.QTimer()
+        self._watchdog.setInterval(300)
+        self._watchdog.timeout.connect(self._reassert_capture)
+        self._watchdog.start()
+
+    def _reassert_capture(self):
+        if not self.capture_excluded:
+            return
+        for widget in list(self._widgets):
+            try:
+                if widget.isVisible():
+                    apply_exclude_from_capture(widget, enabled=True, quiet=True)
+            except Exception:
+                pass
 
     def register(self, widget):
         if widget is None:
@@ -233,6 +266,12 @@ class WindowVisibilityController:
                 pass
 
     def set_capture_excluded(self, enabled):
+        """Thread-safe: may be called from a network thread (a peer toggling
+        stealth). Hops to the GUI thread before touching any windows."""
+        self._capture_request.emit(bool(enabled))
+
+    @QtCore.Slot(bool)
+    def _apply_capture_excluded(self, enabled):
         self.capture_excluded = bool(enabled)
         get_logger().info("stealth (screen-capture exclusion) -> %s", self.capture_excluded)
         for widget in list(self._widgets):
@@ -512,6 +551,7 @@ class Overlay(QtWidgets.QWidget):
     shared_text_changed = QtCore.Signal(str)     # local user edited the shared notepad
     stealth_toggled = QtCore.Signal(bool)        # user toggled stealth -> sync to peer
     refresh_requested = QtCore.Signal()          # user asked to restart transcription
+    remote_requested = QtCore.Signal()           # viewer asked to view/control the host
 
     def __init__(self, start_geometry=None, language_code=DEFAULT_LANGUAGE_CODE,
                  role="solo"):
@@ -652,6 +692,17 @@ class Overlay(QtWidgets.QWidget):
         self.stealth_toggle.clicked.connect(self._toggle_stealth_mode)
         self._refresh_stealth_button()
         h.addWidget(self.stealth_toggle)
+
+        if self._role == "viewer":
+            self.remote_btn = QtWidgets.QPushButton("Remote")
+            self.remote_btn.setObjectName("winbtn")
+            self.remote_btn.setFixedWidth(58)
+            self.remote_btn.setCursor(Qt.PointingHandCursor)
+            self.remote_btn.setFlat(True)
+            self.remote_btn.setFocusPolicy(Qt.NoFocus)
+            self.remote_btn.setToolTip("View and control the host's screen")
+            self.remote_btn.clicked.connect(self.remote_requested.emit)
+            h.addWidget(self.remote_btn)
 
         self.refresh_btn = QtWidgets.QPushButton("⟳")
         self.refresh_btn.setObjectName("refreshbtn")
@@ -940,6 +991,33 @@ class Overlay(QtWidgets.QWidget):
         # disabling stealth. show() runs after every such recreation, so we
         # re-assert capture exclusion here to keep it sticky.
         self._apply_capture_exclusion()
+        # Dragging onto a monitor with a different DPI makes Qt recreate the native
+        # window on the new screen; that new handle resets to WDA_NONE. Re-assert
+        # the instant the screen changes (screenChanged fires as the move crosses),
+        # so the window can't flash into a capture mid-drag.
+        handle = self.windowHandle()
+        if handle is not None and not getattr(self, "_screen_hooked", False):
+            self._screen_hooked = True
+            handle.screenChanged.connect(lambda _s: self._reassert_exclusion())
+
+    def _reassert_exclusion(self):
+        if self._visibility_controller.capture_excluded:
+            apply_exclude_from_capture(self, enabled=True, quiet=True)
+
+    def event(self, e):
+        # The native HWND is recreated on some moves (cross-DPI monitors, flag
+        # changes); the new handle has no capture-exclusion. Re-assert it the
+        # moment the handle changes — the tightest point possible — so stealth
+        # can't lapse for even a frame while the window is being moved.
+        if e.type() == QtCore.QEvent.Type.WinIdChange:
+            self._reassert_exclusion()
+        return super().event(e)
+
+    def moveEvent(self, e):
+        super().moveEvent(e)
+        # Keep the window excluded from capture WHILE dragging, so a stealth
+        # window never flashes into a remote viewer's screen mid-move.
+        self._reassert_exclusion()
 
     # Generous leading + a clear gap after each block, so a long answer is easy
     # to scan and you don't lose your place between lines.

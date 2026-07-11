@@ -4,6 +4,9 @@
 #   .\build.ps1            # normal windowed build  -> dist\IronStack.exe
 #   .\build.ps1 -Debug     # console build (shows logs) -> dist\IronStack-debug.exe
 #
+# Both builds request UAC elevation at launch (one exe for Host and Viewer); the
+# Host needs it to control admin windows, the Viewer just accepts the prompt.
+#
 # Run from the project root inside the virtualenv that has the deps installed.
 #
 # The build bakes the project's .env (your API keys) INTO the exe so it runs
@@ -33,6 +36,13 @@ if ($Debug) {
     $name = 'IronStack'
 }
 
+# --uac-admin embeds a manifest that requests elevation (UAC) at launch. ONE build
+# for both roles: the Viewer just accepts the prompt (harmless), and the Host runs
+# elevated so it can remote-control admin-integrity windows (e.g. AnyDesk's Accept
+# dialog) — a non-elevated app can't inject input into them (Windows UIPI). The UAC
+# secure desktop itself + Ctrl+Alt+Del still need a SYSTEM service (a later phase).
+$uac = @('--uac-admin')
+
 # --collect-data soundcard: soundcard reads a 'mediafoundation.py.h' data file
 # from its package at import time; without this the frozen app crashes.
 #   --icon       embeds the .ico as the .exe's Windows resource (taskbar etc.)
@@ -54,6 +64,8 @@ python -m PyInstaller --noconfirm --clean `
     --add-data "assets\IronStack.ico;assets" `
     --add-data ".env;." `
     --collect-data soundcard `
+    --collect-all av `
+    @uac `
     main.py
 
 # A native process failure does NOT trip $ErrorActionPreference='Stop', so check
