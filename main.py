@@ -691,6 +691,17 @@ def _run_setup(launcher):
 
 
 def main():
+    # Claim an explicit AppUserModelID before any window exists, so Windows draws
+    # the taskbar button from OUR window icon (the remote-view window, and any
+    # non-tool window) instead of falling back to the host python.exe icon. This
+    # is what setWindowIcon alone can't fix. Harmless no-op off Windows.
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+                ctypes.c_wchar_p(config.APP_ID))
+        except Exception:
+            pass
+
     app = QtWidgets.QApplication(sys.argv)
     # The setup/interview loop below drives the window lifecycle explicitly, so
     # don't let Qt auto-quit when a window closes between the two phases (or when

@@ -5,7 +5,15 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # --- App version ---
-VERSION = "3.0.1"
+VERSION = "3.0.2"
+
+# Explicit Windows AppUserModelID. Windows draws a taskbar button's icon from the
+# process's AppUserModelID, NOT from setWindowIcon — so without this a script run
+# under python.exe shows the Python interpreter's icon on the taskbar (e.g. the
+# remote-view window). A stable id makes Windows use our own window icon and group
+# our windows under one button; it must be applied at startup before any window is
+# created (see main()).
+APP_ID = "IronStack.App"
 
 
 def _base_dir() -> Path:

@@ -37,6 +37,11 @@ WM_QUIT = 0x0012
 WDA_NONE = 0x00
 WDA_EXCLUDEFROMCAPTURE = 0x11   # window invisible to captures (Win10 2004 / build 19041+)
 
+# Extended-window-style access for click-through (mouse pass-through). Only the
+# hit-test bit is touched — see set_window_click_through.
+GWL_EXSTYLE = -20
+WS_EX_TRANSPARENT = 0x00000020
+
 # Virtual key codes
 VK_H = 0x48   # show/hide
 VK_C = 0x43   # click-through
@@ -176,6 +181,60 @@ def set_window_topmost(widget, topmost=True):
         return bool(user32.SetWindowPos(wintypes.HWND(hwnd), h_insert, 0, 0, 0, 0, flags))
     except Exception:
         get_logger().exception("pin: SetWindowPos failed (topmost=%s)", topmost)
+        return False
+
+
+def set_window_click_through(widget, enabled=True):
+    """Toggle click-through (mouse pass-through) on a window's EXISTING native
+    handle by flipping only the WS_EX_TRANSPARENT extended style. Returns True
+    on success.
+
+    This deliberately avoids Qt's Qt.WindowTransparentForInput flag, which does
+    two things that break stealth:
+      1. setWindowFlags() makes Qt destroy and recreate the native HWND, and the
+         new handle resets to WDA_NONE -- silently disabling capture exclusion.
+      2. it forces WS_EX_LAYERED on, and on some GPUs a layered window is
+         composited on a path where WDA_EXCLUDEFROMCAPTURE no longer hides it, so
+         the overlay leaks into the host's own screen capture as a black box on
+         the viewer (works on some PCs, fails on others, depending on GPU/driver).
+
+    WS_EX_TRANSPARENT only changes hit-testing, not how the window is composited.
+    But writing GWL_EXSTYLE still makes DWM rebuild the window's composition,
+    which drops the EFFECTIVE capture exclusion on the (unchanged) handle -- so a
+    caller keeping stealth on MUST force-reassert it right after this returns
+    (see Overlay._force_reassert_exclusion). Not recreating the handle keeps that
+    a cheap, reliable re-assert instead of the fragile layered-window path Qt's
+    flag takes."""
+    if not sys.platform.startswith("win") or _user32 is None:
+        return False
+    try:
+        hwnd = int(widget.winId())
+    except Exception:
+        get_logger().debug("click-through: no window handle yet", exc_info=True)
+        return False
+    try:
+        # Get/SetWindowLongPtrW on 64-bit; the plain Long variants on 32-bit
+        # (where the Ptr symbols aren't exported).
+        get_long = getattr(_user32, "GetWindowLongPtrW", None) or _user32.GetWindowLongW
+        set_long = getattr(_user32, "SetWindowLongPtrW", None) or _user32.SetWindowLongW
+        get_long.restype = ctypes.c_ssize_t
+        get_long.argtypes = [wintypes.HWND, ctypes.c_int]
+        set_long.restype = ctypes.c_ssize_t
+        set_long.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t]
+
+        ex = get_long(hwnd, GWL_EXSTYLE)
+        new_ex = (ex | WS_EX_TRANSPARENT) if enabled else (ex & ~WS_EX_TRANSPARENT)
+        if new_ex == ex:
+            return True
+        ctypes.set_last_error(0)
+        set_long(hwnd, GWL_EXSTYLE, new_ex)
+        err = ctypes.get_last_error()
+        if err:
+            get_logger().warning("click-through: SetWindowLong failed (err=%d)", err)
+            return False
+        return True
+    except Exception:
+        get_logger().exception("click-through: toggling WS_EX_TRANSPARENT failed")
         return False
 
 
@@ -986,7 +1045,9 @@ class Overlay(QtWidgets.QWidget):
         # recreates that handle whenever window flags change (click-through,
         # pin fallback), and the new handle resets to WDA_NONE -- silently
         # disabling stealth. show() runs after every such recreation, so we
-        # re-assert capture exclusion here to keep it sticky.
+        # restore click-through (GWL_EXSTYLE) first, then re-assert capture
+        # exclusion last so EXCLUDE lands after that ex-style write.
+        self._reassert_click_through()
         self._apply_capture_exclusion()
         # Dragging onto a monitor with a different DPI makes Qt recreate the native
         # window on the new screen; that new handle resets to WDA_NONE. Re-assert
@@ -1001,12 +1062,37 @@ class Overlay(QtWidgets.QWidget):
         if self._visibility_controller.capture_excluded:
             apply_exclude_from_capture(self, enabled=True, quiet=True)
 
+    def _force_reassert_exclusion(self):
+        # A GWL_EXSTYLE change (the click-through toggle) makes DWM rebuild the
+        # window's composition and silently drops the EFFECTIVE capture exclusion,
+        # even though the HWND is unchanged. Re-applying EXCLUDE is a no-op then
+        # (the affinity VALUE hasn't changed, so Windows skips the rebuild — which
+        # is also why the 300ms watchdog never rescues it), so force a real
+        # WDA_NONE -> WDA_EXCLUDEFROMCAPTURE transition. Same thing that makes
+        # toggling the Stealth button off/on clear the black box by hand.
+        if not self._visibility_controller.capture_excluded:
+            return
+        apply_exclude_from_capture(self, enabled=False, quiet=True)
+        apply_exclude_from_capture(self, enabled=True, quiet=True)
+
+    def _reassert_click_through(self):
+        # WS_EX_TRANSPARENT lives on the native handle, so a handle recreation
+        # (cross-DPI move, pin fallback) drops it. Re-assert when click-through
+        # is meant to be on, alongside the capture-exclusion re-assert.
+        if self._click_through:
+            set_window_click_through(self, enabled=True)
+
     def event(self, e):
         # The native HWND is recreated on some moves (cross-DPI monitors, flag
         # changes); the new handle has no capture-exclusion. Re-assert it the
         # moment the handle changes — the tightest point possible — so stealth
         # can't lapse for even a frame while the window is being moved.
         if e.type() == QtCore.QEvent.Type.WinIdChange:
+            # Order matters: restore click-through (a GWL_EXSTYLE write) FIRST,
+            # then assert capture exclusion LAST, so EXCLUDE lands after the
+            # composition rebuild the ex-style change triggers — on a fresh
+            # handle (WDA_NONE) that's a real transition, so it sticks.
+            self._reassert_click_through()
             self._reassert_exclusion()
         return super().event(e)
 
@@ -1270,14 +1356,26 @@ class Overlay(QtWidgets.QWidget):
 
     def _toggle_click_through(self):
         self._click_through = not self._click_through
-        flags = self.windowFlags()
-        if self._click_through:
-            flags |= Qt.WindowTransparentForInput
+        if sys.platform.startswith("win"):
+            # Flip WS_EX_TRANSPARENT on the existing handle — no HWND recreation
+            # and no WS_EX_LAYERED change (see set_window_click_through), unlike
+            # Qt.WindowTransparentForInput which does both and leaks the overlay
+            # into the host's screen capture as a black box on some GPUs.
+            set_window_click_through(self, enabled=self._click_through)
+            # The GWL_EXSTYLE write still makes DWM rebuild the composition, which
+            # drops the EFFECTIVE capture exclusion on the (unchanged) handle — so
+            # the overlay would show as a black box on the viewer until stealth is
+            # toggled by hand. Force it back on right away.
+            self._force_reassert_exclusion()
         else:
-            flags &= ~Qt.WindowTransparentForInput
+            flags = self.windowFlags()
+            if self._click_through:
+                flags |= Qt.WindowTransparentForInput
+            else:
+                flags &= ~Qt.WindowTransparentForInput
+            self.setWindowFlags(flags)
+            self.show()
         self._refresh_status(True)
-        self.setWindowFlags(flags)
-        self.show()
 
     def _apply_pin_state(self):
         self._pinned = self._visibility_controller.pinned
