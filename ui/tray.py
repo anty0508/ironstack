@@ -29,7 +29,7 @@ class AppTray(QtCore.QObject):
         self._on_quit = None
 
         self.tray = QtWidgets.QSystemTrayIcon(icon, self)
-        self.tray.setToolTip("IronStack")
+        self.tray.setToolTip(f"IronStack v{config.VERSION}")
 
         # Keep a reference to the menu: QSystemTrayIcon.setContextMenu does not
         # take ownership, so a local would be garbage-collected and take its

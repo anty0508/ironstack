@@ -4,6 +4,9 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
+# --- App version ---
+VERSION = "3.0.1"
+
 
 def _base_dir() -> Path:
     """Directory the app runs from. When frozen to an .exe this is the folder

@@ -18,7 +18,7 @@ Qt = QtCore.Qt
 from storage import database
 from storage import documents
 from services.context import build_prompt_from_documents
-from config import LANGUAGES, DEFAULT_LANGUAGE_CODE, language_name
+from config import LANGUAGES, DEFAULT_LANGUAGE_CODE, VERSION, language_name
 from logsetup import get_logger
 from ui.overlay import Overlay, apply_exclude_from_capture, get_window_visibility_controller, set_window_topmost  # for _format_answer in the transcript viewer
 
@@ -90,6 +90,9 @@ QListWidget#doclist::item:selected, QListWidget#history::item:selected {
     background: rgba(242,163,60,0.18); color: #f6c98a; }
 QListWidget#doclist::item:hover, QListWidget#history::item:hover {
     background: rgba(255,255,255,0.04); }
+QListWidget#hostlist::item { padding: 4px 10px; border-radius: 6px; }
+QListWidget#hostlist::item:selected { background: rgba(242,163,60,0.18); color: #f6c98a; }
+QListWidget#hostlist::item:hover { background: rgba(255,255,255,0.04); }
 
 QPushButton { background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.10);
     border-radius: 9px; padding: 8px 16px; color: #e8eaf0; }
@@ -399,7 +402,8 @@ class MessageDialog(QtWidgets.QDialog):
     near-invisible text on a white background, so we roll our own."""
 
     def __init__(self, title, message, parent=None,
-                 confirm_text=None, cancel_text="OK", danger=False):
+                 confirm_text=None, cancel_text="OK", danger=False,
+                 input_default=None, input_placeholder=""):
         super().__init__(parent)
         # WindowStaysOnTopHint so this dialog is never buried under the always-on-
         # top overlay / setup window (e.g. an incoming-connection approval that the
@@ -429,6 +433,16 @@ class MessageDialog(QtWidgets.QDialog):
         text.setWordWrap(True)
         text.setMinimumWidth(340)
         v.addWidget(text, 1)
+
+        # Optional text input (styled rename/prompt dialog). When present, Enter
+        # confirms and the entered value is read back via `self.input.text()`.
+        self.input = None
+        if input_default is not None:
+            self.input = QtWidgets.QLineEdit(input_default)
+            self.input.setPlaceholderText(input_placeholder)
+            self.input.selectAll()
+            self.input.returnPressed.connect(self.accept)
+            v.addWidget(self.input)
 
         row = QtWidgets.QHBoxLayout()
         row.setSpacing(10)
@@ -471,6 +485,8 @@ class MessageDialog(QtWidgets.QDialog):
             set_window_topmost(self, True)
         except Exception:
             pass
+        if self.input is not None:
+            self.input.setFocus()
 
 
 def _page(title, hint):
@@ -705,9 +721,14 @@ class Launcher(QtWidgets.QDialog):
         dot.setObjectName("appDot")
         title = QtWidgets.QLabel("IronStack")
         title.setObjectName("appTitle")
+        ver = QtWidgets.QLabel(f"v{VERSION}")
+        ver.setObjectName("appVersion")
+        ver.setStyleSheet("color: #6b7280; font-size: 11px;")
         hl.addWidget(dot)
         hl.addSpacing(8)
         hl.addWidget(title)
+        hl.addSpacing(6)
+        hl.addWidget(ver)
         hl.addStretch(1)
 
         self.stealth_toggle = QtWidgets.QPushButton("Stealth Off")
@@ -938,17 +959,6 @@ class Launcher(QtWidgets.QDialog):
             row.addWidget(lbl)
             return row
 
-        # --- this instance's name ---
-        name_row = _row("THIS DEVICE'S NAME")
-        self.name_edit = QtWidgets.QLineEdit(self.net.name)
-        self.name_edit.setPlaceholderText("e.g. Home-PC")
-        save_name = QtWidgets.QPushButton("Save name")
-        save_name.setObjectName("ghost")
-        save_name.clicked.connect(self._save_instance_name)
-        name_row.addWidget(self.name_edit, 1)
-        name_row.addWidget(save_name)
-        layout.addLayout(name_row)
-
         # --- this device's connection ID (others connect to you with this) ---
         id_row = _row("YOUR CONNECTION ID")
         self.my_id_edit = QtWidgets.QLineEdit(self.net.host_id)
@@ -987,8 +997,9 @@ class Launcher(QtWidgets.QDialog):
         # Saved hosts: pick one (fills the ID), Rename to give the opaque id a
         # friendly name, or double-click to join. Populated as you connect.
         self.saved_list = QtWidgets.QListWidget()
-        self.saved_list.setObjectName("doclist")
-        self.saved_list.setMinimumHeight(120)
+        self.saved_list.setObjectName("hostlist")
+        self.saved_list.setSpacing(1)
+        self.saved_list.setMinimumHeight(96)
         self.saved_list.itemSelectionChanged.connect(self._on_saved_selected)
         self.saved_list.itemDoubleClicked.connect(lambda _=None: self._join_by_id())
         layout.addWidget(self.saved_list, 1)
@@ -1023,9 +1034,6 @@ class Launcher(QtWidgets.QDialog):
         self._refresh_saved_hosts()
         return page
 
-    def _save_instance_name(self):
-        self.net.set_name(self.name_edit.text())
-
     def _copy_id(self):
         QtWidgets.QApplication.clipboard().setText(self.net.host_id)
 
@@ -1055,10 +1063,12 @@ class Launcher(QtWidgets.QDialog):
             return
         current = next((h.get("name", "") for h in database.get_saved_hosts()
                         if h["id"] == hid), "")
-        name, ok = QtWidgets.QInputDialog.getText(
-            self, "Rename host", f"Name for {hid}:", text=current)
-        if ok:
-            database.rename_saved_host(hid, name.strip())
+        dlg = MessageDialog(
+            "Rename host", f"Friendly name for {hid}:", parent=self,
+            confirm_text="Save", cancel_text="Cancel",
+            input_default=current, input_placeholder="e.g. Work laptop")
+        if dlg.exec() == QtWidgets.QDialog.Accepted:
+            database.rename_saved_host(hid, dlg.input.text().strip())
             self._refresh_saved_hosts()
 
     def _remove_saved(self):

@@ -1,10 +1,9 @@
 # Build IronStack into a single .exe (dist\IronStack.exe).
 #
 #   pip install -r requirements.txt   # includes PyInstaller
-#   .\build.ps1            # normal windowed build  -> dist\IronStack.exe
-#   .\build.ps1 -Debug     # console build (shows logs) -> dist\IronStack-debug.exe
+#   .\build.ps1            # windowed build -> dist\IronStack.exe
 #
-# Both builds request UAC elevation at launch (one exe for Host and Viewer); the
+# The build requests UAC elevation at launch (one exe for Host and Viewer); the
 # Host needs it to control admin windows, the Viewer just accepts the prompt.
 #
 # Run from the project root inside the virtualenv that has the deps installed.
@@ -14,26 +13,10 @@
 # don't distribute this build publicly. A .env placed next to the .exe still
 # overrides the baked-in one.
 
-param(
-    # -Debug: build a CONSOLE exe (a terminal window opens alongside the app and
-    # shows the log output). Use this to debug networking on a machine where you
-    # can only run the exe, not python. The normal build is windowed (no console).
-    [switch]$Debug
-)
-
 $ErrorActionPreference = 'Stop'
 
 if (-not (Test-Path .env)) {
     Write-Error "No .env found. Create one with OPENAI_API_KEY / DEEPGRAM_API_KEY before building (it gets baked into the exe)."
-}
-
-if ($Debug) {
-    $windowFlag = '--console'
-    $name = 'IronStack-debug'
-    Write-Host "Building DEBUG (console) build -> dist\IronStack-debug.exe" -ForegroundColor Yellow
-} else {
-    $windowFlag = '--windowed'
-    $name = 'IronStack'
 }
 
 # --uac-admin embeds a manifest that requests elevation (UAC) at launch. ONE build
@@ -58,8 +41,8 @@ $uac = @('--uac-admin')
 # Going through the module uses whichever python is on PATH (the active venv).
 python -m PyInstaller --noconfirm --clean `
     --onefile `
-    $windowFlag `
-    --name $name `
+    --windowed `
+    --name IronStack `
     --icon assets\IronStack.ico `
     --add-data "assets\IronStack.ico;assets" `
     --add-data ".env;." `
@@ -75,4 +58,4 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 Write-Host ""
-Write-Host "Done -> dist\$name.exe" -ForegroundColor Green
+Write-Host "Done -> dist\IronStack.exe" -ForegroundColor Green

@@ -35,7 +35,6 @@ WM_QUIT = 0x0012
 
 # Window display-affinity modes (SetWindowDisplayAffinity)
 WDA_NONE = 0x00
-WDA_MONITOR = 0x01              # content shows as black in captures (Windows 7+)
 WDA_EXCLUDEFROMCAPTURE = 0x11   # window invisible to captures (Win10 2004 / build 19041+)
 
 # Virtual key codes
@@ -80,17 +79,20 @@ def _is_remote_session():
 def apply_exclude_from_capture(widget, enabled=True, quiet=False):
     """Hide a window from Windows screen capture / screen sharing.
 
-    Prefers WDA_EXCLUDEFROMCAPTURE (the window is fully invisible to capture),
-    which needs Windows 10 v2004 (build 19041) or newer. On older builds that
-    flag is rejected, so we fall back to WDA_MONITOR (the window shows up as a
-    black box in captures, supported back to Windows 7). Returns True if any
-    affinity mode was applied.
+    Uses WDA_EXCLUDEFROMCAPTURE (the window is fully invisible to capture), which
+    needs Windows 10 v2004 (build 19041) or newer. Returns True if it was applied.
 
-    `quiet` downgrades the fallback/failure warnings to debug — used by the
-    periodic re-assertion so it doesn't spam the log every second.
+    There is intentionally no WDA_MONITOR fallback: that mode does not hide the
+    window, it renders it as a solid black box in captures, which is more
+    conspicuous than the window itself and is what leaks into recordings on
+    sessions where real exclusion is unavailable.
 
-    The whole feature relies on Desktop Window Manager (GPU) composition; in
-    Remote Desktop sessions / some VMs both modes fail regardless of build."""
+    `quiet` downgrades the failure warning to debug — used by the periodic
+    re-assertion so it doesn't spam the log every second.
+
+    The feature relies on Desktop Window Manager (GPU) composition; in Remote
+    Desktop sessions / some VMs it fails regardless of build, and the window will
+    simply be visible in the capture (read answers on the Viewer instead)."""
     if not sys.platform.startswith("win") or _user32 is None:
         return False
 
@@ -118,7 +120,11 @@ def apply_exclude_from_capture(widget, enabled=True, quiet=False):
                         err, _windows_build())
         return bool(ok)
 
-    # Enabling: try full invisibility, then the black-box fallback.
+    # Enabling: WDA_EXCLUDEFROMCAPTURE is the only mode that truly hides the
+    # window. We deliberately do NOT fall back to WDA_MONITOR: that mode doesn't
+    # hide anything, it paints the window as a solid BLACK box in the capture --
+    # more conspicuous than the window itself, and exactly what leaks into a
+    # recording on Remote Desktop / VM sessions where EXCLUDEFROMCAPTURE fails.
     ok, excl_err = _apply(WDA_EXCLUDEFROMCAPTURE, "WDA_EXCLUDEFROMCAPTURE")
     if ok:
         log.debug("stealth: applied WDA_EXCLUDEFROMCAPTURE (invisible to capture)")
@@ -126,22 +132,13 @@ def apply_exclude_from_capture(widget, enabled=True, quiet=False):
     if ok is None:
         return False
 
-    ok, mon_err = _apply(WDA_MONITOR, "WDA_MONITOR")
-    if ok:
-        (log.debug if quiet else log.warning)(
-            "stealth: WDA_EXCLUDEFROMCAPTURE rejected (err=%d) on Windows build "
-            "%s; fell back to WDA_MONITOR (window shows as BLACK in captures, "
-            "not invisible).", excl_err, _windows_build())
-        return True
-    if ok is None:
-        return False
-
     (log.debug if quiet else log.warning)(
         "stealth: could NOT hide window from capture "
-        "(build=%s, EXCLUDEFROMCAPTURE err=%d, MONITOR err=%d, remote_session=%s). "
-        "Both modes need GPU/DWM composition; this usually means a Remote Desktop "
-        "session or a VM without it. Screen-sharing will show this window.",
-        _windows_build(), excl_err, mon_err, _is_remote_session())
+        "(build=%s, EXCLUDEFROMCAPTURE err=%d, remote_session=%s). "
+        "EXCLUDEFROMCAPTURE needs GPU/DWM composition; this usually means a Remote "
+        "Desktop session or a VM without it. Screen-sharing will show this window "
+        "(read answers on the Viewer instead). No black-box fallback is applied.",
+        _windows_build(), excl_err, _is_remote_session())
     return False
 
 
