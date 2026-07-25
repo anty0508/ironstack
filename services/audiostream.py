@@ -253,12 +253,19 @@ class AudioClient:
         self.connect = connect          # () -> connected socket (relay mode)
         self.on_status = on_status
         self._stop = threading.Event()
+        self._muted = threading.Event()
         self._sock = None
         self._fifo = _SampleFIFO(MAX_LAG)
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
         threading.Thread(target=self._play_loop, daemon=True).start()
+
+    def set_muted(self, muted):
+        if muted:
+            self._muted.set()
+        else:
+            self._muted.clear()
 
     def stop(self):
         self._stop.set()
@@ -338,7 +345,12 @@ class AudioClient:
                 while not self._stop.is_set():
                     # read() paces itself only when data exists; player.play blocks
                     # ~one frame of real time, so playback stays near real time.
-                    player.play(self._fifo.read(FRAME_SAMPLES).reshape(-1, 1))
+                    # Always drain the FIFO so it doesn't back up; when muted,
+                    # play silence so the host's voice never reaches the speaker.
+                    frame = self._fifo.read(FRAME_SAMPLES).reshape(-1, 1)
+                    if self._muted.is_set():
+                        frame = np.zeros_like(frame)
+                    player.play(frame)
         except Exception:
             get_logger().exception("audio: playback failed")
 

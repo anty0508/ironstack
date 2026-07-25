@@ -183,12 +183,17 @@ class NetServer:
     `on_approve`) and broadcast meeting messages to all of them."""
 
     def __init__(self, tcp_port, name="IronStack", on_approve=None, on_message=None,
-                 approved=None, on_approved_change=None):
+                 approved=None, on_approved_change=None, password_getter=None):
         self.tcp_port = tcp_port
         self.name = name
         # on_approve(peer_dict) -> bool. Called on the handshake thread when a
         # viewer connects; may block until the host decides. None == auto-accept.
         self.on_approve = on_approve
+        # password_getter() -> current stored password hash ("" if none). Read
+        # fresh per connection so the host can set/clear it while already hosting.
+        # When a password is set, a viewer sending the right one is auto-accepted
+        # (no dialog); a wrong one is denied; none falls back to the host prompt.
+        self._password_getter = password_getter
         # on_message(msg). Called when a connected viewer sends a message back
         # (e.g. a shared-notepad edit). The server also relays it to the other
         # viewers so everyone stays in sync.
@@ -294,6 +299,17 @@ class NetServer:
             peer = {"name": hello.get("name", "Viewer"), "ip": addr[0]}
             resume = str(hello.get("resume", "") or "")
             vid = str(hello.get("viewer_id", "") or "")
+            code = str(hello.get("code", "") or "")
+
+            def _prompt():
+                # Fall back to the host's Accept/Reject dialog. No approver == accept.
+                if self.on_approve is None:
+                    return True
+                try:
+                    return bool(self.on_approve(peer))
+                except Exception:
+                    get_logger().exception("net: approval callback failed")
+                    return False
 
             # A viewer we already approved reconnecting after a dropped link (common
             # on slow networks) -> skip the dialog. Match on either the exchanged
@@ -304,17 +320,35 @@ class NetServer:
                                   peer["name"], addr[0])
                 approved = True
             else:
-                get_logger().info("net: hello from %s (name=%r) -> awaiting host approval",
-                                  addr[0], peer["name"])
-                # Ask the host to approve (Accept/Reject dialog); may block until
-                # the host clicks. No approver == accept.
-                approved = True
-                if self.on_approve is not None:
+                stored = ""
+                if self._password_getter is not None:
                     try:
-                        approved = bool(self.on_approve(peer))
+                        stored = self._password_getter() or ""
                     except Exception:
-                        get_logger().exception("net: approval callback failed")
-                        approved = False
+                        get_logger().exception("net: reading host password failed")
+                if stored:
+                    # Unattended access is configured: the password is the gate.
+                    from services import authpass
+                    if code and authpass.verify_password(code, stored):
+                        get_logger().info("net: %s (%s) authenticated by password",
+                                          peer["name"], addr[0])
+                        approved = True
+                    elif code:
+                        self._safe_send(conn, {"type": "denied",
+                                               "reason": "wrong password"})
+                        conn.close()
+                        get_logger().info("net: viewer %s (%s) sent wrong password",
+                                          peer["name"], addr[0])
+                        return
+                    else:
+                        # No password offered -> let the host decide manually.
+                        get_logger().info("net: hello from %s (name=%r), no password "
+                                          "-> awaiting host approval", addr[0], peer["name"])
+                        approved = _prompt()
+                else:
+                    get_logger().info("net: hello from %s (name=%r) -> awaiting host approval",
+                                      addr[0], peer["name"])
+                    approved = _prompt()
             if not approved:
                 self._safe_send(conn, {"type": "denied",
                                        "reason": "the host declined the connection"})
@@ -677,6 +711,11 @@ class Broadcaster:
     def show_user_answer(self, text):
         self._emit("user_answer", text=text)
 
+    def discard_user_answer(self):
+        # The mic picked up the interviewer's voice (echo); drop the partial
+        # "You" bubble that started streaming on the viewers.
+        self._emit("user_discard")
+
     # --- shared notepad (host's local edits -> viewers) ---
     def share_text(self, text):
         self._emit("shared_text", text=text)
@@ -715,6 +754,8 @@ def apply_message(overlay, msg):
         overlay.user_partial(msg.get("text", ""))
     elif t == "user_answer":
         overlay.show_user_answer(msg.get("text", ""))
+    elif t == "user_discard":
+        overlay.discard_user_answer()
     elif t == "shared_text":
         overlay.set_shared_text(msg.get("text", ""))
     elif t == "meeting_start":
@@ -752,9 +793,10 @@ class _HostNet:
     """Bundle of the host's TCP server + UDP beacon, started/stopped together."""
 
     def __init__(self, name, host_id, tcp_port, on_approve=None,
-                 approved=None, on_approved_change=None):
+                 approved=None, on_approved_change=None, password_getter=None):
         self.server = NetServer(tcp_port, name=name, on_approve=on_approve,
-                                approved=approved, on_approved_change=on_approved_change)
+                                approved=approved, on_approved_change=on_approved_change,
+                                password_getter=password_getter)
         self.beacon = Beacon(name, host_id, tcp_port)
 
     def start(self):
@@ -815,6 +857,22 @@ class NetController:
         self._db.set_setting("instance_name", name)
         if self._hostnet is not None:
             self._hostnet.set_name(name)
+
+    # --- unattended-access password ---
+    def _password_hash(self):
+        """Current stored password hash ('' if none). Read live per connection."""
+        return self._db.get_setting("net_host_password", "")
+
+    def has_password(self):
+        return bool(self._password_hash())
+
+    def set_password(self, password):
+        """Set (or clear, if blank) the host's unattended-access password. Only a
+        salted hash is stored. Takes effect immediately, even while hosting."""
+        from services import authpass
+        password = (password or "").strip()
+        self._db.set_setting("net_host_password",
+                             authpass.hash_password(password) if password else "")
 
     def set_tcp_port(self, port):
         """Change the host listen port (persisted). Applies the next time hosting
@@ -893,7 +951,8 @@ class NetController:
         approved = self._db.get_approved_peers()
         hostnet = _HostNet(self.name, self.host_id, self.tcp_port, on_approve,
                            approved=approved,
-                           on_approved_change=self._db.set_approved_peers)
+                           on_approved_change=self._db.set_approved_peers,
+                           password_getter=self._password_hash)
         try:
             hostnet.start()
         except OSError as exc:

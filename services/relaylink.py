@@ -107,11 +107,29 @@ def _splice(a, b, a_to_b=b""):
 # Viewer side
 # ======================================================================
 
-def dial_via_relay(relay_host, relay_port, room, channel, timeout=15.0):
+def dial_via_relay(relay_host, relay_port, room, channel, timeout=15.0, on_phase=None):
     """Dial the relay and return a socket paired to the host's `channel`. Raises
-    OSError if the relay is unreachable or no host is registered for the room."""
-    sock = socket.create_connection((relay_host, int(relay_port)), timeout=15)
+    OSError if the relay is unreachable or no host is registered for the room.
+
+    `on_phase(code)` (optional) reports progress so the UI can distinguish a relay
+    failure from a host failure: 'relay_connecting', 'relay_failed',
+    'host_connecting', 'host_failed'."""
+    def _phase(code):
+        if on_phase is not None:
+            try:
+                on_phase(code)
+            except Exception:
+                pass
+
+    _phase("relay_connecting")
+    try:
+        sock = socket.create_connection((relay_host, int(relay_port)), timeout=15)
+    except OSError:
+        _phase("relay_failed")
+        raise
     sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    # Relay reached; now it must splice us to a host registered for this room.
+    _phase("host_connecting")
     try:
         _send_line(sock, {"v": 1, "role": "viewer", "room": room, "channel": channel})
         line = _recv_line(sock, timeout=timeout)
@@ -121,12 +139,14 @@ def dial_via_relay(relay_host, relay_port, room, channel, timeout=15.0):
             sock.close()
         except OSError:
             pass
+        _phase("host_failed")
         raise OSError(f"relay handshake failed: {exc}")
     if not msg.get("ok"):
         try:
             sock.close()
         except OSError:
             pass
+        _phase("host_failed")
         raise OSError(msg.get("error", "relay: host not available"))
     return sock
 

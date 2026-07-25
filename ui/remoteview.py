@@ -72,15 +72,29 @@ class _ScreenView(QtWidgets.QWidget):
         # as the remote cursor (mss doesn't capture the host's own cursor).
         self._img = None
         self._rect = QtCore.QRect()
+        self._status_text = "Connecting…"
 
     def set_frame(self, qimage):
         self._img = qimage
         self.update()
 
+    def set_status_text(self, text):
+        # The centered banner shown until (and between) frames — connection
+        # progress, then "Loading host screen…", then it's covered by frames.
+        self._status_text = text or ""
+        if self._img is None:
+            self.update()
+
     def paintEvent(self, _e):
         p = QtGui.QPainter(self)
         p.fillRect(self.rect(), Qt.black)
         if self._img is None:
+            if self._status_text:
+                p.setPen(QtGui.QColor("#c9cede"))
+                f = p.font()
+                f.setPointSize(15)
+                p.setFont(f)
+                p.drawText(self.rect(), Qt.AlignCenter, self._status_text)
             return
         area = self.rect()
         size = self._img.size().scaled(area.size(), Qt.KeepAspectRatio)
@@ -164,12 +178,13 @@ class RemoteView(QtWidgets.QWidget):
 
     _sig_frame = QtCore.Signal(QtGui.QImage)
     _sig_status = QtCore.Signal(str)
+    _sig_conn = QtCore.Signal(str)
     _sig_cursor = QtCore.Signal(str)
     _sig_toggle_view = QtCore.Signal()
     closed = QtCore.Signal()
 
-    def __init__(self, host, media_port, token, monitors, monitor_id, send_input,
-                 connect_screen=None):
+    def __init__(self, host, send_input, connect_screen=None, on_open_transcript=None,
+                 on_toggle_mute=None):
         super().__init__()
         self.setWindowTitle("IronStack — Remote")
         # Use the IronStack icon (this is a separate top-level window, so give it
@@ -181,16 +196,20 @@ class RemoteView(QtWidgets.QWidget):
             pass
         self.resize(1100, 680)
         self._host = host
-        self._media_port = media_port
-        self._token = token
+        # Screen params arrive later via start_screen() (after the host offers the
+        # media port + token over the control channel).
+        self._media_port = None
+        self._token = None
         # In relay mode this dials a fresh screen socket through the relay; when
         # None the client connects directly to host:media_port.
         self._connect_screen = connect_screen
-        self._monitors = monitors or [{"id": 1, "name": "Display 1"}]
-        self._monitor_id = monitor_id
+        self._monitors = [{"id": 1, "name": "Display 1"}]
+        self._monitor_id = 1
         # Input goes over the reliable TCP control channel (supplied by caller);
         # the screen rides its own TCP socket.
         self._send_input_cb = send_input
+        self._on_open_transcript = on_open_transcript
+        self._on_toggle_mute = on_toggle_mute
         self._client = None
         self._quality = "high"
         self._view_only = False
@@ -203,6 +222,7 @@ class RemoteView(QtWidgets.QWidget):
         self.setStyleSheet(STYLE)
         self._sig_frame.connect(self._view.set_frame)
         self._sig_status.connect(self._on_status)
+        self._sig_conn.connect(self._view.set_status_text)
         self._sig_cursor.connect(self._on_cursor)
         # Toggle is emitted from the keyboard-hook path; hop to the GUI thread.
         self._sig_toggle_view.connect(self._viewonly_btn.toggle)
@@ -213,13 +233,28 @@ class RemoteView(QtWidgets.QWidget):
         self._keyhook = KeyboardHook(on_key=self._on_hook_key,
                                      should_capture=self._should_capture_keys)
 
+    def set_connection_status(self, text):
+        """Thread-safe: update the big centered banner (control-connection
+        progress, shown before any screen frames)."""
+        self._sig_conn.emit(text or "")
+
+    def start_screen(self, media_port, token, monitors, monitor_id):
+        """Begin (or restart) the screen stream once the host has offered it."""
+        self._media_port = media_port
+        self._token = token
+        self._monitors = monitors or [{"id": 1, "name": "Display 1"}]
+        self._monitor_id = monitor_id
+        self._populate_monitor_combo()
+        self._sig_conn.emit("Loading host screen…")
         self._connect(monitor_id)
 
     def _should_capture_keys(self):
-        # Observe keys whenever the window is focused (both modes) so the
-        # double-tap-Ctrl toggle works even in view-only; the per-key decision of
-        # send-to-host vs pass-through happens in _on_hook_key.
-        return self.isActiveWindow()
+        # Observe keys whenever the window is focused AND a screen stream exists
+        # (both modes) so the double-tap-Ctrl toggle works even in view-only; the
+        # per-key decision of send-to-host vs pass-through happens in _on_hook_key.
+        # Before the screen connects there's nothing to control, so don't swallow
+        # the user's keystrokes while they wait on the connecting banner.
+        return self._client is not None and self.isActiveWindow()
 
     def _on_hook_key(self, vk, down, ext):
         """Return True to swallow the key locally, False to let it pass through."""
@@ -254,6 +289,8 @@ class RemoteView(QtWidgets.QWidget):
         return False
 
     def _connect(self, monitor_id):
+        if self._token is None:
+            return   # the host hasn't offered the screen yet (start_screen not called)
         from services.remote import RemoteScreenClient
         if self._client is not None:
             self._client.stop()
@@ -268,6 +305,30 @@ class RemoteView(QtWidgets.QWidget):
     @QtCore.Slot(str)
     def _on_cursor(self, name):
         self._view.setCursor(_CURSOR_SHAPES.get(name, Qt.ArrowCursor))
+
+    def _populate_monitor_combo(self):
+        self._mon_combo.blockSignals(True)
+        self._mon_combo.clear()
+        for m in self._monitors:
+            self._mon_combo.addItem(
+                f"{m.get('name', 'Display')} "
+                f"({m.get('width', '?')}x{m.get('height', '?')})", m["id"])
+        idx = self._mon_combo.findData(self._monitor_id)
+        self._mon_combo.setCurrentIndex(idx if idx >= 0 else 0)
+        self._mon_combo.blockSignals(False)
+        self._mon_combo.setVisible(len(self._monitors) > 1)
+        self._reposition_bar()
+
+    def _open_transcript(self):
+        if self._on_open_transcript is not None:
+            self._on_open_transcript()
+
+    def _toggle_mute(self, muted):
+        self._mute_btn.setText("🔇" if muted else "🔊")
+        self._mute_btn.setToolTip(
+            "Unmute the host's audio" if muted else "Mute the host's audio")
+        if self._on_toggle_mute is not None:
+            self._on_toggle_mute(muted)
 
     # ---- layout ----
     def _build_ui(self):
@@ -297,6 +358,19 @@ class RemoteView(QtWidgets.QWidget):
         self._status_lbl.setObjectName("rvstat")
         h.addWidget(self._status_lbl)
 
+        self._transcript_btn = QtWidgets.QPushButton("Transcript")
+        self._transcript_btn.setCursor(Qt.PointingHandCursor)
+        self._transcript_btn.setToolTip("Open the interview transcript window")
+        self._transcript_btn.clicked.connect(self._open_transcript)
+        h.addWidget(self._transcript_btn)
+
+        self._mute_btn = QtWidgets.QPushButton("🔊")
+        self._mute_btn.setCheckable(True)
+        self._mute_btn.setCursor(Qt.PointingHandCursor)
+        self._mute_btn.setToolTip("Mute the host's audio")
+        self._mute_btn.toggled.connect(self._toggle_mute)
+        h.addWidget(self._mute_btn)
+
         self._viewonly_btn = QtWidgets.QPushButton("View only")
         self._viewonly_btn.setCheckable(True)
         self._viewonly_btn.setCursor(Qt.PointingHandCursor)
@@ -314,17 +388,13 @@ class RemoteView(QtWidgets.QWidget):
         self._quality_combo.currentIndexChanged.connect(self._on_quality_changed)
         h.addWidget(self._quality_combo)
 
-        if len(self._monitors) > 1:
-            self._mon_combo = QtWidgets.QComboBox()
-            self._mon_combo.setObjectName("rvcombo")
-            for m in self._monitors:
-                self._mon_combo.addItem(
-                    f"{m.get('name', 'Display')} "
-                    f"({m.get('width', '?')}x{m.get('height', '?')})", m["id"])
-            idx = self._mon_combo.findData(self._monitor_id)
-            self._mon_combo.setCurrentIndex(idx if idx >= 0 else 0)
-            self._mon_combo.currentIndexChanged.connect(self._on_monitor_changed)
-            h.addWidget(self._mon_combo)
+        # Monitor picker: always present, populated/shown once the host offers its
+        # monitor list (start_screen). Hidden while there's a single display.
+        self._mon_combo = QtWidgets.QComboBox()
+        self._mon_combo.setObjectName("rvcombo")
+        self._mon_combo.currentIndexChanged.connect(self._on_monitor_changed)
+        self._mon_combo.hide()
+        h.addWidget(self._mon_combo)
 
         fs = QtWidgets.QPushButton("⛶")
         fs.setCursor(Qt.PointingHandCursor)

@@ -213,16 +213,33 @@ def set_saved_hosts(hosts):
     set_setting("net_saved_hosts", json.dumps(hosts))
 
 
-def add_saved_host(host_id, name=""):
-    """Add a host id if new (keeping any existing name). Returns the updated list."""
+def add_saved_host(host_id, name="", password=None):
+    """Add a host id if new (keeping any existing name). When `password` is not
+    None, store/update this host's saved password (pass '' to clear it). Returns
+    the updated list."""
     host_id = str(host_id or "").strip()
     if not host_id:
         return get_saved_hosts()
     hosts = get_saved_hosts()
-    if not any(h["id"] == host_id for h in hosts):
-        hosts.append({"id": host_id, "name": str(name or "")})
-        set_saved_hosts(hosts)
+    existing = next((h for h in hosts if h["id"] == host_id), None)
+    if existing is None:
+        entry = {"id": host_id, "name": str(name or "")}
+        if password is not None:
+            entry["password"] = str(password)
+        hosts.append(entry)
+    elif password is not None:
+        existing["password"] = str(password)
+    set_saved_hosts(hosts)
     return hosts
+
+
+def get_saved_host_password(host_id):
+    """The saved password for a host id, or '' if none is stored."""
+    host_id = str(host_id or "").strip()
+    for h in get_saved_hosts():
+        if h["id"] == host_id:
+            return h.get("password", "")
+    return ""
 
 
 def rename_saved_host(host_id, name):

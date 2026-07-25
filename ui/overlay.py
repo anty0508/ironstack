@@ -593,6 +593,7 @@ class Overlay(QtWidgets.QWidget):
     _sig_question = QtCore.Signal(str)    # interviewer line (always shown)
     _sig_user = QtCore.Signal(str)        # candidate's own spoken answer (final)
     _sig_user_partial = QtCore.Signal(str)   # candidate's live (streaming) speech
+    _sig_user_discard = QtCore.Signal()      # drop the streaming "You" bubble (echo)
     _sig_begin_answer = QtCore.Signal()   # an answer is about to stream
     _sig_delta = QtCore.Signal(str)
     _sig_end = QtCore.Signal(str)
@@ -607,7 +608,6 @@ class Overlay(QtWidgets.QWidget):
     shared_text_changed = QtCore.Signal(str)     # local user edited the shared notepad
     stealth_toggled = QtCore.Signal(bool)        # user toggled stealth -> sync to peer
     refresh_requested = QtCore.Signal()          # user asked to restart transcription
-    remote_requested = QtCore.Signal()           # viewer asked to view/control the host
 
     def __init__(self, start_geometry=None, language_code=DEFAULT_LANGUAGE_CODE,
                  role="solo"):
@@ -660,6 +660,7 @@ class Overlay(QtWidgets.QWidget):
         self._sig_question.connect(self._on_question)
         self._sig_user.connect(self._on_user_answer)
         self._sig_user_partial.connect(self._on_user_partial)
+        self._sig_user_discard.connect(self._on_user_discard)
         self._sig_set_shared.connect(self._on_set_shared_text)
         self._sig_connected.connect(self._on_connected)
         self._sig_set_language.connect(self._on_set_language)
@@ -748,17 +749,6 @@ class Overlay(QtWidgets.QWidget):
         self.stealth_toggle.clicked.connect(self._toggle_stealth_mode)
         self._refresh_stealth_button()
         h.addWidget(self.stealth_toggle)
-
-        if self._role == "viewer":
-            self.remote_btn = QtWidgets.QPushButton("Remote")
-            self.remote_btn.setObjectName("winbtn")
-            self.remote_btn.setFixedWidth(58)
-            self.remote_btn.setCursor(Qt.PointingHandCursor)
-            self.remote_btn.setFlat(True)
-            self.remote_btn.setFocusPolicy(Qt.NoFocus)
-            self.remote_btn.setToolTip("View and control the host's screen")
-            self.remote_btn.clicked.connect(self.remote_requested.emit)
-            h.addWidget(self.remote_btn)
 
         self.refresh_btn = QtWidgets.QPushButton("⟳")
         self.refresh_btn.setObjectName("refreshbtn")
@@ -1033,6 +1023,11 @@ class Overlay(QtWidgets.QWidget):
 
     def _scroll_to_top(self):
         bar = self.scroll.verticalScrollBar()
+        # Only pull the view back to the top when it is already at (or within a
+        # few px of) the top. If the user has scrolled down to read earlier
+        # content, leave their position alone instead of yanking it up.
+        if bar.value() > bar.minimum() + 4:
+            return
         QtCore.QTimer.singleShot(0, lambda: bar.setValue(bar.minimum()))
 
     def resizeEvent(self, e):
@@ -1217,6 +1212,22 @@ class Overlay(QtWidgets.QWidget):
             body.setTextFormat(Qt.PlainText)
             body.setText(text)
         self._current_body = None
+
+    @QtCore.Slot()
+    def _on_user_discard(self):
+        # The streaming "You" bubble turned out to be the interviewer's echoed
+        # voice; remove it so no duplicate remains.
+        if self._user_body is None:
+            return
+        frame = self._user_body.parentWidget()   # the "ububble" QFrame
+        if frame is not None:
+            if frame in self._bubbles:
+                self._bubbles.remove(frame)
+            row = frame.parentWidget()            # the row that holds the frame
+            if row is not None:
+                self.chat_layout.removeWidget(row)
+                row.deleteLater()
+        self._user_body = None
 
     @QtCore.Slot(str)
     def _on_set_shared_text(self, text):
@@ -1457,6 +1468,9 @@ class Overlay(QtWidgets.QWidget):
 
     def user_partial(self, text):
         self._sig_user_partial.emit(text or "")
+
+    def discard_user_answer(self):
+        self._sig_user_discard.emit()
 
     def set_shared_text(self, text):
         self._sig_set_shared.emit(text or "")

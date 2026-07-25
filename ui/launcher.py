@@ -970,6 +970,23 @@ class Launcher(QtWidgets.QDialog):
         id_row.addWidget(copy_id)
         layout.addLayout(id_row)
 
+        # --- unattended-access password (viewers with it skip your approval) ---
+        pw_row = _row("ACCESS PASSWORD")
+        self.host_pw_edit = QtWidgets.QLineEdit()
+        self.host_pw_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.host_pw_edit.returnPressed.connect(self._save_host_password)
+        save_pw = QtWidgets.QPushButton("Save")
+        save_pw.setObjectName("ghost")
+        save_pw.clicked.connect(self._save_host_password)
+        clear_pw = QtWidgets.QPushButton("Clear")
+        clear_pw.setObjectName("ghost")
+        clear_pw.clicked.connect(self._clear_host_password)
+        pw_row.addWidget(self.host_pw_edit, 1)
+        pw_row.addWidget(save_pw)
+        pw_row.addWidget(clear_pw)
+        layout.addLayout(pw_row)
+        self._sync_host_pw_placeholder()
+
         # --- relay server (shared by host + viewer) ---
         relay_row = _row("RELAY SERVER")
         self.relay_edit = QtWidgets.QLineEdit(self.net.relay_addr)
@@ -1020,14 +1037,21 @@ class Launcher(QtWidgets.QDialog):
             database.get_setting("viewer_peer_id", ""))
         self.peer_id_edit.setPlaceholderText("Host's connection ID")
         self.peer_id_edit.returnPressed.connect(self._join_by_id)
-        layout.addWidget(self.peer_id_edit)
 
-        join_row = QtWidgets.QHBoxLayout()
-        join_row.addStretch(1)
+        self.join_pw_edit = QtWidgets.QLineEdit(
+            database.get_saved_host_password(database.get_setting("viewer_peer_id", "")))
+        self.join_pw_edit.setEchoMode(QtWidgets.QLineEdit.Password)
+        self.join_pw_edit.setPlaceholderText("Host's password (blank to ask)")
+        self.join_pw_edit.returnPressed.connect(self._join_by_id)
+
         join_btn = QtWidgets.QPushButton("Join as Viewer")
         join_btn.setObjectName("primary")
         join_btn.setCursor(Qt.PointingHandCursor)
         join_btn.clicked.connect(self._join_by_id)
+
+        join_row = QtWidgets.QHBoxLayout()
+        join_row.addWidget(self.peer_id_edit, 3)
+        join_row.addWidget(self.join_pw_edit, 2)
         join_row.addWidget(join_btn)
         layout.addLayout(join_row)
 
@@ -1036,6 +1060,30 @@ class Launcher(QtWidgets.QDialog):
 
     def _copy_id(self):
         QtWidgets.QApplication.clipboard().setText(self.net.host_id)
+
+    def _sync_host_pw_placeholder(self):
+        if self.net.has_password():
+            self.host_pw_edit.setPlaceholderText(
+                "Password is set — type a new one to change it")
+        else:
+            self.host_pw_edit.setPlaceholderText(
+                "No password — viewers need your approval each time")
+
+    def _save_host_password(self):
+        pw = self.host_pw_edit.text().strip()
+        if not pw:
+            self._warn("Enter a password to set, or use Clear to remove it.")
+            return
+        self.net.set_password(pw)
+        self.host_pw_edit.clear()
+        self._sync_host_pw_placeholder()
+        self._warn("Access password saved. Viewers who enter it connect without "
+                   "your approval.")
+
+    def _clear_host_password(self):
+        self.net.set_password("")
+        self.host_pw_edit.clear()
+        self._sync_host_pw_placeholder()
 
     # ---- saved hosts list ----
     def _refresh_saved_hosts(self):
@@ -1055,6 +1103,7 @@ class Launcher(QtWidgets.QDialog):
         hid = self._selected_saved_id()
         if hid:
             self.peer_id_edit.setText(hid)
+            self.join_pw_edit.setText(database.get_saved_host_password(hid))
 
     def _rename_saved(self):
         hid = self._selected_saved_id()
@@ -1114,11 +1163,14 @@ class Launcher(QtWidgets.QDialog):
         # Persist the relay + last peer so they're pre-filled next time, and add
         # this host to the saved list (keeps any name it already has).
         self.net.set_relay_addr(self.relay_edit.text().strip())
+        password = self.join_pw_edit.text()
         database.set_setting("viewer_peer_id", peer_id)
-        database.add_saved_host(peer_id)
+        # Remember the password with this host, so selecting it later fills it in.
+        database.add_saved_host(peer_id, password=password)
         self.mode = "viewer"
         self.viewer_target = {"mode": "relay", "relay_host": rhost,
-                              "relay_port": rport, "room": peer_id}
+                              "relay_port": rport, "room": peer_id,
+                              "password": password}
         self.accept()
 
     # ---- history page ----

@@ -1,9 +1,12 @@
+import re
 import sys
+import time
 import ctypes
 import queue
 import asyncio
 import threading
 import getpass
+from collections import deque
 
 # Windows COM apartment: claim STA for the main thread BEFORE importing anything
 # that touches COM. Qt's QApplication calls OleInitialize(), which requires a
@@ -79,15 +82,86 @@ class QuestionFilter:
         self.enqueue(text)
 
 
+class EchoGuard:
+    """The interviewer's voice plays out of the speakers and bleeds into the
+    mic, so the mic stream transcribes it too -- producing a duplicate "You"
+    bubble on the viewers. Remember what the interviewer stream said recently
+    and treat a mic utterance that echoes it as a duplicate to drop.
+
+    A mic phrase is considered an echo when almost all of its words appear in a
+    single recent interviewer utterance; a genuine answer that only reuses a few
+    of the question's keywords stays below that bar and is kept."""
+
+    _WORD = re.compile(r"\w+", re.UNICODE)
+
+    def __init__(self, window_s=8.0, containment=0.8):
+        self._window = window_s
+        self._containment = containment
+        self._recent = deque()          # (monotonic_ts, frozenset(tokens))
+        self._lock = threading.Lock()
+
+    @classmethod
+    def _tokens(cls, text):
+        return cls._WORD.findall((text or "").lower())
+
+    def _prune(self, now):
+        cutoff = now - self._window
+        while self._recent and self._recent[0][0] < cutoff:
+            self._recent.popleft()
+
+    def note(self, text):
+        """Record something the interviewer stream just said (interim or final)."""
+        toks = frozenset(self._tokens(text))
+        if not toks:
+            return
+        now = time.monotonic()
+        with self._lock:
+            self._recent.append((now, toks))
+            self._prune(now)
+
+    def is_echo(self, text):
+        toks = self._tokens(text)
+        if len(toks) < 2:
+            return False   # too short to tell an echo from a real one-word reply
+        tokset = set(toks)
+        now = time.monotonic()
+        with self._lock:
+            self._prune(now)
+            for _, itoks in self._recent:
+                if len(tokset & itoks) / len(tokset) >= self._containment:
+                    return True
+        return False
+
+
+class _EchoTap:
+    """Wraps the interviewer transcriber's console so its live text also feeds
+    the EchoGuard, while every call still reaches the real console unchanged."""
+
+    def __init__(self, console, guard):
+        self._console = console
+        self._guard = guard
+
+    def partial(self, text):
+        self._guard.note(text)
+        self._console.partial(text)
+
+    def __getattr__(self, name):
+        return getattr(self._console, name)
+
+
 class _MicConsole:
     """The microphone transcriber's 'console'. Live partials stream into the
     candidate's "You" bubble token by token (via the broadcaster's user_partial,
-    which also mirrors to Viewers); status lines are dropped."""
+    which also mirrors to Viewers); status lines are dropped. Partials that echo
+    the interviewer's voice are suppressed so no ghost bubble streams in."""
 
-    def __init__(self, console):
+    def __init__(self, console, guard=None):
         self.console = console
+        self.guard = guard
 
     def partial(self, text):
+        if self.guard is not None and self.guard.is_echo(text):
+            return
         self.console.user_partial(text)
 
     def info(self, text):
@@ -362,8 +436,15 @@ def _run_interview(app, tray, system_prompt, meeting_id, start_geometry=None,
 
     threading.Thread(target=answer_worker, daemon=True).start()
 
+    # The interviewer's voice bleeds from the speakers into the mic, so the mic
+    # stream would transcribe it too and show a duplicate "You" bubble. The guard
+    # remembers the interviewer's recent words (fed via _EchoTap) so the mic
+    # stream can drop utterances that echo them.
+    echo_guard = EchoGuard()
+
     question_filter = QuestionFilter(answer_queue.put)
-    transcriber = Transcriber(on_question=question_filter.feed, console=console,
+    transcriber = Transcriber(on_question=question_filter.feed,
+                              console=_EchoTap(console, echo_guard),
                               language=language_code, source="loopback")
 
     # Second stream: the candidate's own microphone. Live words stream into the
@@ -371,13 +452,20 @@ def _run_interview(app, tray, system_prompt, meeting_id, start_geometry=None,
     # bubble in and is saved. This does NOT trigger an AI answer. Finals go
     # straight through (no merge filter) so each utterance finalizes promptly.
     def on_user_speech(text):
+        if echo_guard.is_echo(text):
+            # Echo of the interviewer picked up by the mic: drop it and clear any
+            # partial "You" bubble that started streaming before we were sure.
+            get_logger().info("mic: dropped echoed interviewer speech: %r", text)
+            console.discard_user_answer()
+            return
         console.show_user_answer(text)
         try:
             database.add_message(meeting_id, "candidate", text)
         except Exception:
             get_logger().exception("failed to persist candidate line")
 
-    mic_transcriber = Transcriber(on_question=on_user_speech, console=_MicConsole(console),
+    mic_transcriber = Transcriber(on_question=on_user_speech,
+                                  console=_MicConsole(console, echo_guard),
                                   language=language_code, source="microphone")
 
     # Refresh button (local or triggered remotely by a viewer): restart both
@@ -507,38 +595,140 @@ class _RemoteBridge(QtCore.QObject):
     offer = QtCore.Signal(object)
 
 
-def _run_viewer(app, tray, net, target, start_geometry=None):
-    """Run as a Viewer: open an overlay and drive it from a Host's stream.
+class _MeetingRecorder:
+    """Viewer-side transcript recorder. Persists the meeting it's mirroring into
+    the same local DB (meetings + messages) the host uses and with the same roles
+    ('interviewer' / 'me' / 'candidate'), so a viewed interview shows up in the
+    'Past meetings' history exactly like a hosted one.
 
-    No audio capture or answering happens here -- the overlay is a live mirror of
-    the Host's meeting. Blocks until the user ends/quits; returns True to go back
-    to setup, False to quit the app.
+    The meeting row is created lazily on the first content line — so joining a
+    meeting already in progress still records — and closed on meeting_end /
+    meeting_start, so each host interview becomes its own row. All calls arrive
+    serially on the network receive thread; the DB uses short-lived connections."""
+
+    def __init__(self):
+        self._meeting_id = None
+        self._answer = None       # str while an AI answer streams, else None
+        self._host_name = ""
+
+    def set_host_name(self, name):
+        self._host_name = (name or "").strip()
+
+    def _ensure_meeting(self):
+        if self._meeting_id is None:
+            try:
+                self._meeting_id = database.create_meeting(
+                    "Viewed interview", self._host_name, [])
+            except Exception:
+                get_logger().exception("viewer: could not create meeting record")
+        return self._meeting_id
+
+    def _save(self, role, content):
+        content = (content or "").strip()
+        if not content:
+            return
+        mid = self._ensure_meeting()
+        if mid is None:
+            return
+        try:
+            database.add_message(mid, role, content)
+        except Exception:
+            get_logger().exception("viewer: could not save %s line", role)
+
+    def finalize(self):
+        # Flush a half-streamed answer, then close the meeting so the next one
+        # starts a fresh row.
+        if self._answer:
+            self._save("me", self._answer)
+        self._answer = None
+        self._meeting_id = None
+
+    def record(self, msg):
+        t = msg.get("type")
+        if t == "question":
+            self._save("interviewer", msg.get("text", ""))
+        elif t == "answer_begin":
+            self._answer = ""
+        elif t == "answer_delta":
+            if self._answer is not None:
+                self._answer += msg.get("delta", "")
+        elif t == "answer_end":
+            if self._answer is not None:
+                self._save("me", self._answer)   # skipped if empty (e.g. NO_ANSWER)
+                self._answer = None
+        elif t == "user_answer":
+            self._save("candidate", msg.get("text", ""))
+        elif t in ("meeting_start", "meeting_end"):
+            self.finalize()
+
+
+def _run_viewer(app, tray, net, target, start_geometry=None):
+    """Run as a Viewer: the host's shared SCREEN is the primary window; the
+    interview transcript is a secondary window opened from its toolbar.
+
+    The remote-screen window opens immediately and shows the connection status
+    (relay -> host -> connected) until the host's screen streams in. Closing it
+    ends the viewer session; the host ending a meeting does NOT (the connection
+    and screen share stay live). Returns True to go back to setup, False to quit.
     """
     log = get_logger()
 
     # target: {"mode":"relay","relay_host":h,"relay_port":p,"room":<host id>}.
     # The viewer reaches the host through the relay by ID — no direct connection.
     from services import relaylink
+    from ui.remoteview import RemoteView
     rhost, rport, room = target["relay_host"], target["relay_port"], target["room"]
+    password = target.get("password", "")   # host's unattended-access password, if any
     host, port = room, 0     # placeholders; the dialers below do the connecting
-    control_dialer = lambda: relaylink.dial_via_relay(rhost, rport, room, "control")
     screen_connect = lambda: relaylink.dial_via_relay(rhost, rport, room, "screen")
     where = f"id {room} via relay {rhost}:{rport}"
     log.info("viewer connecting to %s", where)
 
-    overlay = Overlay(start_geometry=start_geometry, role="viewer")
-    overlay.show()
-    if tray is not None:
-        tray.set_window(overlay)
-    overlay.info(f"[viewer] connecting to {where} — waiting for host to accept…")
+    # Report relay-vs-host connection phases on the screen window's banner.
+    def on_conn_phase(code):
+        text = {
+            "relay_connecting": "Connecting to relay server…",
+            "relay_failed": "Relay server connection failed",
+            "host_connecting": "Connecting to host…",
+            "host_failed": "Host connection failed",
+        }.get(code)
+        if text:
+            remote.set_connection_status(text)
 
-    # Remote-desktop windows this viewer has open (kept referenced so they live).
-    remote_windows = []
-    remote_bridge = _RemoteBridge()
+    control_dialer = lambda: relaylink.dial_via_relay(
+        rhost, rport, room, "control", on_phase=on_conn_phase)
+
+    # The transcript window: created hidden, shown via the screen's "Transcript"
+    # button. It's a live mirror of the host's meeting; no capture/answering here.
+    overlay = Overlay(start_geometry=start_geometry, role="viewer")
+
+    def show_transcript():
+        overlay.show()
+        overlay.raise_()
+        overlay.activateWindow()
 
     # Live meeting audio played on this PC's speakers (one client, re-offered on
     # each (re)connect so it always uses a fresh token).
-    audio = {"client": None}
+    audio = {"client": None, "muted": False}
+
+    # Mute the host's live audio locally (client-side only; the host keeps
+    # transcribing). State is remembered so it survives audio reconnects.
+    def on_mute_toggled(muted):
+        audio["muted"] = muted
+        if audio["client"] is not None:
+            audio["client"].set_muted(muted)
+
+    # The primary window: the host's screen. Opens now, before anything connects.
+    remote = RemoteView(
+        host,
+        send_input=lambda ev: client.send({"type": "input", **ev}),
+        connect_screen=screen_connect,
+        on_open_transcript=show_transcript,
+        on_toggle_mute=on_mute_toggled)
+    remote.set_connection_status("Connecting to relay server…")
+    remote.show()
+    if tray is not None:
+        tray.set_window(remote)
 
     def open_audio(msg):
         try:
@@ -549,44 +739,43 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
                 room, 0, msg.get("token"),
                 connect=lambda: relaylink.dial_via_relay(rhost, rport, room, "audio"),
                 on_status=lambda s: get_logger().info("viewer audio: %s", s))
+            ac.set_muted(audio["muted"])   # carry the mute state across reconnects
             ac.start()
             audio["client"] = ac
         except Exception:
             get_logger().exception("audio: could not start playback (deps missing?)")
 
+    remote_bridge = _RemoteBridge()
+
     def open_remote(msg):
-        # GUI thread: open the remote-desktop window for the host's offer. Guard
-        # the whole thing so a missing dep (e.g. PyAV) shows a message, not a crash.
+        # GUI thread: start (or restart) the screen stream on the offer. Guard so
+        # a missing dep (e.g. PyAV) shows a message on the banner, not a crash.
+        monitors = msg.get("monitors") or [{"id": 1, "name": "Display 1"}]
         try:
-            from ui.remoteview import RemoteView
-            monitors = msg.get("monitors") or [{"id": 1, "name": "Display 1"}]
-            rv = RemoteView(
-                host, msg.get("media_port"), msg.get("token"),
-                monitors, monitors[0].get("id", 1),
-                # Input rides the reliable control channel; screen is its own socket
-                # (direct to host:media_port, or dialed through the relay).
-                send_input=lambda ev: client.send({"type": "input", **ev}),
-                connect_screen=screen_connect)
+            remote.start_screen(msg.get("media_port"), msg.get("token"),
+                                monitors, monitors[0].get("id", 1))
         except Exception:
-            get_logger().exception("remote: could not open view (deps missing?)")
-            overlay.info("[remote] unavailable (missing components — reinstall requirements)")
-            return
-        rv.closed.connect(lambda: remote_windows.remove(rv) if rv in remote_windows else None)
-        remote_windows.append(rv)
-        rv.show()
-        rv.raise_()
+            get_logger().exception("remote: could not start screen (deps missing?)")
+            remote.set_connection_status(
+                "Screen unavailable — missing components (reinstall requirements)")
 
     remote_bridge.offer.connect(open_remote)
 
-    # Received messages replay onto the overlay; overlay methods are thread-safe.
+    # Save the mirrored meeting locally, so a viewed interview appears in the same
+    # "Past meetings" history as a hosted one.
+    recorder = _MeetingRecorder()
+
+    # Received messages replay onto the transcript overlay; overlay methods are
+    # thread-safe.
     def on_message(msg):
-        # When the host ends the meeting, end the viewer session too.
+        recorder.record(msg)   # persist the transcript (also sees meeting_end below)
+        # The host ending a meeting no longer ends the viewer: the connection and
+        # screen share stay live (the host may start another meeting).
         if msg.get("type") == "meeting_end":
-            overlay.info("[host ended the meeting]")
-            overlay.end_meeting.emit()
+            overlay.info("[host ended the meeting — connection stays open]")
             return
         if msg.get("type") == "remote_offer":
-            remote_bridge.offer.emit(msg)   # -> GUI thread opens the window
+            remote_bridge.offer.emit(msg)   # -> GUI thread starts the screen
             return
         if msg.get("type") == "audio_offer":
             open_audio(msg)                 # start/replace speaker playback
@@ -595,13 +784,23 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
 
     def on_status(text):
         get_logger().info("viewer: %s", text)   # surface the outcome in the console too
-        overlay.info(f"[viewer] {text}")
-        if text.startswith("connected"):
-            overlay.set_connected(True)   # host accepted -> open the shared notepad
+        low = text.lower()
+        if low.startswith("connected"):
+            recorder.set_host_name(text.split("connected to", 1)[-1].strip())
+            remote.set_connection_status("Connected")
+            overlay.set_connected(True)     # host accepted -> open the shared notepad
+            client.send({"type": "cmd", "action": "remote_start"})  # show the screen
             client.send({"type": "cmd", "action": "audio_start"})   # hear the meeting
-        # A dropped link no longer ends the session — NetClient reconnects on its
-        # own (slow/lossy networks). Only "host ended the meeting" (a meeting_end
-        # message) or the user closing the window ends the viewer.
+        elif low.startswith("waiting"):
+            remote.set_connection_status("Connecting to host…")
+        elif low.startswith("denied"):
+            reason = text.split("denied:", 1)[-1].strip() or "declined"
+            remote.set_connection_status("Host connection failed: " + reason)
+        elif low.startswith("reconnecting"):
+            remote.set_connection_status("Reconnecting…")
+        # "connection failed: …" is ignored: the relay dialer already reported the
+        # specific relay/host failure via on_phase. A dropped link never ends the
+        # session — NetClient reconnects on its own.
 
     client = NetClient(
         host, port, name=net.name if net is not None else "viewer",
@@ -609,6 +808,7 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
         on_status=on_status,
         dialer=control_dialer,
         viewer_id=net.host_id if net is not None else "",
+        code=password,
     )
     client.start()
     # Shared notepad: the viewer's local edits go back to the host.
@@ -629,10 +829,6 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
     overlay.language_changed.connect(
         lambda code, name: client.send(
             {"type": "cmd", "action": "language", "code": code, "name": name}))
-    # Remote control: ask the host to share its screen; the offer comes back as a
-    # "remote_offer" message which opens the remote-desktop window.
-    overlay.remote_requested.connect(
-        lambda: client.send({"type": "cmd", "action": "remote_start"}))
 
     loop = QtCore.QEventLoop()
     state = {"quit": False}
@@ -641,20 +837,23 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
         state["quit"] = True
         loop.quit()
 
+    # Closing the primary screen window ends the viewer session; the transcript's
+    # own End button ends it too, but closing the transcript just hides it.
+    remote.closed.connect(loop.quit)
     overlay.end_meeting.connect(loop.quit)
     overlay.quit_app.connect(on_quit)
     if tray is not None:
         tray.set_quit_handler(on_quit)
     loop.exec()
 
-    for rv in list(remote_windows):
-        try:
-            rv.close()
-        except Exception:
-            pass
+    try:
+        remote.close()
+    except Exception:
+        pass
     if audio["client"] is not None:
         audio["client"].stop()
     client.stop()
+    recorder.finalize()   # flush any half-streamed answer (client thread is stopped)
     overlay.shutdown()
     overlay.close()
     app.processEvents()
