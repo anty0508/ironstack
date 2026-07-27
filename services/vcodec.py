@@ -19,13 +19,16 @@ _ENCODER_PREFERENCE = ["h264_nvenc", "h264_qsv", "h264_amf", "libx264"]
 def _encoder_options(name, fps):
     g = str(max(1, fps * 4))   # keyframe interval; keyframe-on-connect handles start
     if name == "libx264":
+        # Software: keep the fastest preset so CPU/latency don't regress.
         return {"preset": "ultrafast", "tune": "zerolatency", "g": g}
     if name == "h264_nvenc":
-        return {"preset": "p1", "tune": "ull", "g": g, "delay": "0"}
+        # Hardware: a mid preset + low-latency tune is far sharper than p1/ull at
+        # the same bitrate, and the GPU has the headroom so latency barely moves.
+        return {"preset": "p4", "tune": "ll", "g": g, "delay": "0"}
     if name == "h264_qsv":
-        return {"preset": "veryfast", "g": g}
+        return {"preset": "faster", "g": g}
     if name == "h264_amf":
-        return {"usage": "ultralowlatency", "quality": "speed", "g": g}
+        return {"usage": "ultralowlatency", "quality": "balanced", "g": g}
     return {"g": g}
 
 
