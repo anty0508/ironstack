@@ -890,6 +890,11 @@ class NetController:
         """Port for the live meeting-audio stream (control port + 2)."""
         return self.tcp_port + 2
 
+    @property
+    def clip_port(self):
+        """Port for clipboard sync (control port + 3)."""
+        return self.tcp_port + 3
+
     def map_extra_port(self, port, protocol="TCP"):
         """Best-effort UPnP-open another port (e.g. the UDP media port) on the router."""
         threading.Thread(target=self._try_upnp, args=(int(port), protocol),
@@ -923,7 +928,7 @@ class NetController:
             return
         agent = RelayAgent(host, port, self.host_id,
                            {"control": self.tcp_port, "screen": self.media_port,
-                            "audio": self.audio_port})
+                            "audio": self.audio_port, "clip": self.clip_port})
         agent.start()
         self._relay_agent = agent
 

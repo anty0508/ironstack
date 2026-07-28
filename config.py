@@ -5,7 +5,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 # --- App version ---
-VERSION = "3.0.2"
+VERSION = "3.0.3"
 
 # Explicit Windows AppUserModelID. Windows draws a taskbar button's icon from the
 # process's AppUserModelID, NOT from setWindowIcon — so without this a script run

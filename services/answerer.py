@@ -27,7 +27,8 @@ class Answerer:
     replies with `[NO_ANSWER]` and nothing is shown. A rolling history of the
     interview is kept so each answer is grounded in what came before."""
 
-    def __init__(self, console, system_prompt, meeting_id=None, language="English"):
+    def __init__(self, console, system_prompt, meeting_id=None, language="English",
+                is_ai_enabled=None):
         if not OPENAI_API_KEY:
             raise RuntimeError("OPENAI_API_KEY is not set")
 
@@ -37,6 +38,7 @@ class Answerer:
         self.meeting_id = meeting_id
         self.language = language or "English"
         self.history = []   # rolling conversation: interviewer lines + my answers
+        self.is_ai_enabled = is_ai_enabled   # optional callable; False/None-return skips OpenAI
         self.log = get_logger()
         self.log.info("Answerer ready (model=%s, meeting_id=%s, language=%s)",
                       ANSWER_MODEL, meeting_id, self.language)
@@ -89,6 +91,11 @@ class Answerer:
         self._save("interviewer", question)
 
         self.log.info("question: %s", question)
+
+        if self.is_ai_enabled is not None and not self.is_ai_enabled():
+            self.log.info("AI answers disabled -> skipping OpenAI call")
+            self._trim()
+            return
 
         stream = self.client.responses.create(
             model=ANSWER_MODEL,

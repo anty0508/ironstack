@@ -403,6 +403,60 @@ def get_window_visibility_controller():
     return _VISIBILITY_CONTROLLER
 
 
+class AIAnswerController(QtCore.QObject):
+    """Shared on/off state for AI-generated answers.
+
+    A QObject for the same reason as WindowVisibilityController: a peer (host or
+    viewer) can toggle this from a network thread, so the request is delivered
+    through a queued signal and applied on the GUI thread before any button
+    repaints."""
+
+    _ai_request = QtCore.Signal(bool)
+
+    def __init__(self):
+        super().__init__()
+        self.ai_enabled = True
+        self._widgets = []
+        self._ai_request.connect(self._apply_ai_enabled)
+
+    def register(self, widget):
+        if widget is None:
+            return
+        if widget not in self._widgets:
+            self._widgets.append(widget)
+
+    def unregister(self, widget):
+        try:
+            self._widgets.remove(widget)
+        except ValueError:
+            pass
+
+    def set_ai_enabled(self, enabled):
+        """Thread-safe: may be called from a network thread (a peer toggling AI)."""
+        self._ai_request.emit(bool(enabled))
+
+    @QtCore.Slot(bool)
+    def _apply_ai_enabled(self, enabled):
+        self.ai_enabled = bool(enabled)
+        get_logger().info("AI answers -> %s", "on" if self.ai_enabled else "off")
+        for widget in list(self._widgets):
+            try:
+                if hasattr(widget, "_refresh_ai_button"):
+                    widget._refresh_ai_button()
+            except Exception:
+                pass
+
+
+_AI_CONTROLLER = None
+
+
+def get_ai_answer_controller():
+    global _AI_CONTROLLER
+    if _AI_CONTROLLER is None:
+        _AI_CONTROLLER = AIAnswerController()
+    return _AI_CONTROLLER
+
+
 class GlobalHotkeys(QtCore.QObject):
     """Register system-wide hotkeys via Win32 and emit `triggered(id)` on the
     GUI thread. Runs its own message loop in a daemon thread."""
@@ -607,6 +661,7 @@ class Overlay(QtWidgets.QWidget):
     language_changed = QtCore.Signal(str, str)   # (deepgram code, display name)
     shared_text_changed = QtCore.Signal(str)     # local user edited the shared notepad
     stealth_toggled = QtCore.Signal(bool)        # user toggled stealth -> sync to peer
+    ai_toggled = QtCore.Signal(bool)             # user toggled AI answers -> sync to peer
     refresh_requested = QtCore.Signal()          # user asked to restart transcription
 
     def __init__(self, start_geometry=None, language_code=DEFAULT_LANGUAGE_CODE,
@@ -641,11 +696,13 @@ class Overlay(QtWidgets.QWidget):
         self._visibility_controller = get_window_visibility_controller()
         self._pinned = self._visibility_controller.pinned
         self._capture_excluded = self._visibility_controller.capture_excluded
+        self._ai_controller = get_ai_answer_controller()
 
         self._build_ui()
         self.setStyleSheet(STYLE)
         self._visibility_controller.register(self)
         self._visibility_controller.set_opacity_percent(self._visibility_controller.opacity_percent)
+        self._ai_controller.register(self)
         self._place(start_geometry)
 
         # animate the "listening" dots when no live transcription is showing
@@ -749,6 +806,17 @@ class Overlay(QtWidgets.QWidget):
         self.stealth_toggle.clicked.connect(self._toggle_stealth_mode)
         self._refresh_stealth_button()
         h.addWidget(self.stealth_toggle)
+
+        self.ai_toggle = QtWidgets.QPushButton("AI")
+        self.ai_toggle.setObjectName("winbtn")
+        self.ai_toggle.setFixedWidth(32)
+        self.ai_toggle.setCursor(Qt.PointingHandCursor)
+        self.ai_toggle.setFlat(True)
+        self.ai_toggle.setFocusPolicy(Qt.NoFocus)
+        self.ai_toggle.setToolTip("AI answers: generate a suggested answer for each question")
+        self.ai_toggle.clicked.connect(self._toggle_ai_mode)
+        self._refresh_ai_button()
+        h.addWidget(self.ai_toggle)
 
         self.refresh_btn = QtWidgets.QPushButton("⟳")
         self.refresh_btn.setObjectName("refreshbtn")
@@ -1365,6 +1433,25 @@ class Overlay(QtWidgets.QWidget):
         # Tell the peer so stealth stays in sync across host and viewer.
         self.stealth_toggled.emit(self._capture_excluded)
 
+    def _refresh_ai_button(self):
+        on = self._ai_controller.ai_enabled
+        self.ai_toggle.setToolTip(
+            "AI answers ON — click to stop generating answers" if on
+            else "AI answers OFF — click to resume generating answers"
+        )
+        self.ai_toggle.setStyleSheet(
+            "font-size:12px; font-weight:600; background: rgba(90,180,255,0.22);"
+            " color: #9fd3ff; border-radius:7px;"
+            if on else
+            "font-size:12px; font-weight:600; background: transparent;"
+            " color: #9aa0b2; border: none;"
+        )
+
+    def _toggle_ai_mode(self):
+        self._ai_controller.set_ai_enabled(not self._ai_controller.ai_enabled)
+        # Tell the peer so the AI on/off state stays in sync across host and viewer.
+        self.ai_toggled.emit(self._ai_controller.ai_enabled)
+
     def _toggle_click_through(self):
         self._click_through = not self._click_through
         if sys.platform.startswith("win"):
@@ -1449,6 +1536,10 @@ class Overlay(QtWidgets.QWidget):
             pass
         try:
             self._visibility_controller.unregister(self)
+        except Exception:
+            pass
+        try:
+            self._ai_controller.unregister(self)
         except Exception:
             pass
 

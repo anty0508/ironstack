@@ -1,5 +1,8 @@
-"""Application logging. Logs to the console (stderr) only — no log file is
-written.
+"""Application logging: console (stderr) plus a rotating file next to the DB.
+
+The packaged build (IronStack.spec: console=False) has no console at all, so
+stderr goes nowhere -- the file is the only way to see what a packaged host or
+viewer actually did after the fact.
 
 Call setup_logging() once at startup; use get_logger() everywhere else.
 setup_logging() also installs global hooks so *uncaught* exceptions — on the
@@ -10,28 +13,41 @@ import logging
 import sys
 import threading
 import faulthandler
+from logging.handlers import RotatingFileHandler
 
 _NAME = "ironstack"
 _configured = False
 
 
 def setup_logging():
-    """Configure the app logger to write to the console and install global
-    exception hooks. Idempotent, and never raises — logging must not stop the
-    app from starting."""
+    """Configure the app logger to write to the console + a log file, and
+    install global exception hooks. Idempotent, and never raises — logging
+    must not stop the app from starting."""
     global _configured
     logger = logging.getLogger(_NAME)
     if _configured:
         return logger
 
+    formatter = logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(threadName)s: %(message)s")
+
     try:
         handler = logging.StreamHandler(sys.stderr)
-        handler.setFormatter(
-            logging.Formatter("%(asctime)s [%(levelname)s] %(threadName)s: %(message)s")
-        )
+        handler.setFormatter(formatter)
         logger.setLevel(logging.INFO)
         logger.addHandler(handler)
         logger.propagate = False
+    except Exception:
+        pass
+
+    try:
+        import config
+        config.DATA_DIR.mkdir(parents=True, exist_ok=True)
+        file_handler = RotatingFileHandler(
+            config.DATA_DIR / "ironstack.log", maxBytes=2 * 1024 * 1024,
+            backupCount=2, encoding="utf-8")
+        file_handler.setFormatter(formatter)
+        logger.addHandler(file_handler)
     except Exception:
         pass
 

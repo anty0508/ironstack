@@ -199,7 +199,7 @@ def _handle(sock):
         role = msg.get("role")
         room = str(msg.get("room", "")).strip()
         channel = str(msg.get("channel", "control"))
-        if not room or channel not in ("control", "screen", "audio"):
+        if not room or channel not in ("control", "screen", "audio", "clip"):
             _send_line(sock, {"error": "bad handshake"})
             sock.close()
             return

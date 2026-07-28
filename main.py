@@ -29,11 +29,12 @@ from config import MIN_TEXT_LENGTH
 from logsetup import setup_logging, get_logger
 from singleinstance import SingleInstance
 from storage import database
-from ui.overlay import Overlay, get_window_visibility_controller
+from ui.overlay import Overlay, get_window_visibility_controller, get_ai_answer_controller
 from ui.launcher import Launcher, MessageDialog
 from services.transcriber import Transcriber
 from services.answerer import Answerer
 from services.netlink import Broadcaster, NetController, NetClient, apply_message
+from services.clipsync import ClipboardServer, ClipboardClient, get_clipboard_sync_controller
 from ui.tray import AppTray, make_app_icon
 
 
@@ -235,6 +236,7 @@ class HostSession:
         self._remote = None            # RemoteScreenServer (TCP)
         self.remote_injector = None    # InputInjector for the shared monitor
         self._audio = None             # AudioServer (TCP) — live meeting audio
+        self._clip = None              # ClipboardServer (TCP) — clipboard sync
 
     # --- lifecycle ---
     def start(self):
@@ -247,6 +249,7 @@ class HostSession:
             self.net.server.on_message = self._dispatch
         self._start_remote()
         self._start_audio()
+        self._start_clip()
         # If relay reachability is enabled, park outbound connections at the relay
         # so viewers can reach this host by its ID over the internet (CGNAT-proof).
         self.net.start_relay()
@@ -285,11 +288,25 @@ class HostSession:
         except Exception:
             get_logger().exception("audio: server failed to start")
 
+    def _start_clip(self):
+        if self._clip is not None:
+            return
+        try:
+            import secrets
+            srv = ClipboardServer(self.net.clip_port, secrets.token_hex(8))
+            srv.start()
+            self._clip = srv
+            self.net.map_extra_port(self.net.clip_port, protocol="TCP")
+        except Exception:
+            get_logger().exception("clipboard: server failed to start")
+
     def stop(self):
         if self._remote is not None:
             self._remote.stop()
         if self._audio is not None:
             self._audio.stop()
+        if self._clip is not None:
+            self._clip.stop()
         self.net.stop_hosting()
 
     # --- interview registration ---
@@ -344,6 +361,20 @@ class HostSession:
         get_logger().info("audio: offered stream to viewer (audio port %d)",
                           self.net.audio_port)
 
+    def _offer_clip(self):
+        # A viewer connected -> offer clipboard sync (rotate the token per offer,
+        # like remote/audio); the viewer dials it right away, no user action needed.
+        self._start_clip()
+        if self._clip is None:
+            return
+        import secrets
+        token = secrets.token_hex(8)
+        self._clip.token = token
+        self.net.send({"type": "clip_offer", "clip_port": self.net.clip_port,
+                       "token": token})
+        get_logger().info("clipboard: offered sync to viewer (clip port %d)",
+                          self.net.clip_port)
+
     def _dispatch(self, msg):
         """Host-side handler for messages a viewer sends back (runs for the whole
         app run, not just during an interview)."""
@@ -353,6 +384,8 @@ class HostSession:
             if action == "stealth":
                 get_window_visibility_controller().set_capture_excluded(
                     bool(msg.get("value")))
+            elif action == "ai_toggle":
+                get_ai_answer_controller().set_ai_enabled(bool(msg.get("value")))
             elif action == "refresh" and self.on_refresh is not None:
                 self.on_refresh()
             elif action == "language":
@@ -367,6 +400,8 @@ class HostSession:
                     self._remote.request_keyframe()
             elif action == "audio_start":
                 self._offer_audio()
+            elif action == "clip_start":
+                self._offer_clip()
             return
         if t == "input":
             # Remote-control input over the reliable TCP control channel -> inject
@@ -414,8 +449,12 @@ def _run_interview(app, tray, system_prompt, meeting_id, start_geometry=None,
         # Remote control: a stealth toggle here syncs to every viewer.
         overlay.stealth_toggled.connect(
             lambda val: net.send({"type": "cmd", "action": "stealth", "value": val}))
+        # AI on/off also syncs to every viewer (and reflects a viewer's own toggle).
+        overlay.ai_toggled.connect(
+            lambda val: net.send({"type": "cmd", "action": "ai_toggle", "value": val}))
 
-    answerer = Answerer(console, system_prompt, meeting_id, language=language_name)
+    answerer = Answerer(console, system_prompt, meeting_id, language=language_name,
+                        is_ai_enabled=lambda: get_ai_answer_controller().ai_enabled)
     answer_queue = queue.Queue()
     stop = threading.Event()
 
@@ -577,6 +616,8 @@ def _handle_message(overlay, msg, on_refresh=None, on_language=None):
         action = msg.get("action")
         if action == "stealth":
             get_window_visibility_controller().set_capture_excluded(bool(msg.get("value")))
+        elif action == "ai_toggle":
+            get_ai_answer_controller().set_ai_enabled(bool(msg.get("value")))
         elif action == "refresh" and on_refresh is not None:
             on_refresh()
         elif action == "language":
@@ -710,6 +751,8 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
     # Live meeting audio played on this PC's speakers (one client, re-offered on
     # each (re)connect so it always uses a fresh token).
     audio = {"client": None, "muted": False}
+    # Clipboard sync client (one at a time, re-offered on each (re)connect).
+    clip = {"client": None}
 
     # Mute the host's live audio locally (client-side only; the host keeps
     # transcribing). State is remembered so it survives audio reconnects.
@@ -744,6 +787,18 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
             audio["client"] = ac
         except Exception:
             get_logger().exception("audio: could not start playback (deps missing?)")
+
+    def open_clip(msg):
+        try:
+            if clip["client"] is not None:
+                clip["client"].stop()
+            cc = ClipboardClient(
+                room, 0, msg.get("token"),
+                connect=lambda: relaylink.dial_via_relay(rhost, rport, room, "clip"))
+            cc.start()
+            clip["client"] = cc
+        except Exception:
+            get_logger().exception("clipboard: could not start sync")
 
     remote_bridge = _RemoteBridge()
 
@@ -780,6 +835,9 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
         if msg.get("type") == "audio_offer":
             open_audio(msg)                 # start/replace speaker playback
             return
+        if msg.get("type") == "clip_offer":
+            open_clip(msg)                  # join clipboard sync
+            return
         _handle_message(overlay, msg)
 
     def on_status(text):
@@ -791,6 +849,7 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
             overlay.set_connected(True)     # host accepted -> open the shared notepad
             client.send({"type": "cmd", "action": "remote_start"})  # show the screen
             client.send({"type": "cmd", "action": "audio_start"})   # hear the meeting
+            client.send({"type": "cmd", "action": "clip_start"})    # sync clipboards
         elif low.startswith("waiting"):
             remote.set_connection_status("Connecting to host…")
         elif low.startswith("denied"):
@@ -818,6 +877,9 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
     # the host's Deepgram (the viewer has none of its own).
     overlay.stealth_toggled.connect(
         lambda val: client.send({"type": "cmd", "action": "stealth", "value": val}))
+    # AI on/off from the viewer syncs to the host (and reflects the host's own toggle).
+    overlay.ai_toggled.connect(
+        lambda val: client.send({"type": "cmd", "action": "ai_toggle", "value": val}))
 
     def on_refresh_clicked():
         overlay.partial("↻ Restarting Deepgram…")
@@ -939,11 +1001,17 @@ def main():
     # whole session, so a host keeps running across the setup <-> meeting loop.
     net = NetController(database)
 
-    # Create the window-visibility controller now, on the GUI thread, so its Qt
-    # thread affinity is correct. A viewer that connects and toggles stealth is
-    # handled on a network thread; the controller marshals that back to the GUI
-    # thread, but only if it was itself created here rather than there.
+    # Create the window-visibility, AI-answer, and clipboard-sync controllers
+    # now, on the GUI thread, so their Qt thread affinity is correct. A viewer
+    # that connects and toggles stealth/AI or copies something is handled on a
+    # network thread; each controller marshals that back to the GUI thread, but
+    # only if it was itself created here rather than there. This matters most
+    # for clipboard sync: the clip server starts accepting connections below,
+    # at app launch, so a viewer can connect (and thus lazily create the
+    # controller from a network thread) before any Overlay ever does.
     get_window_visibility_controller()
+    get_ai_answer_controller()
+    get_clipboard_sync_controller()
 
     # Open the host servers NOW (at app start, not per-interview): the control +
     # media sockets, beacon and UPnP mapping come up immediately, so this PC is
