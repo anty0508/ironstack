@@ -26,6 +26,7 @@ import socket
 import threading
 
 from logsetup import get_logger
+from services.sockopt import enable_keepalive
 
 RELAY_DEFAULT_PORT = 48920
 # How many idle "ready" connections to keep parked per channel. A couple is plenty
@@ -148,6 +149,15 @@ def dial_via_relay(relay_host, relay_port, room, channel, timeout=15.0, on_phase
             pass
         _phase("host_failed")
         raise OSError(msg.get("error", "relay: host not available"))
+    # Handshake done -- this socket now carries the long-lived spliced session.
+    # socket.create_connection()/_recv_line() leave their timeout set on the
+    # socket after returning, so without this a silent stretch longer than that
+    # timeout (a slow keepalive tick, a GUI-thread hiccup on the other end) reads
+    # as a dead connection and drops an otherwise-healthy session. Blocking mode
+    # alone would then miss a truly dead link for minutes (OS TCP defaults), so
+    # TCP keepalive bounds that detection to a few seconds instead.
+    sock.settimeout(None)
+    enable_keepalive(sock)
     return sock
 
 
@@ -253,4 +263,17 @@ class RelayAgent:
                 pass
             return
         local.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        # Both sockets are about to carry the long-lived spliced session. `local`
+        # still has the connect-phase timeout baked in by create_connection(), and
+        # `relay_sock` still has the timeout _await_go() set to wait for "go" --
+        # left in place, a quiet moment past that timeout during normal use (e.g.
+        # a keepalive tick delayed by a busy GUI thread) reads as a dead peer and
+        # tears down an otherwise-healthy connection.
+        local.settimeout(None)
+        relay_sock.settimeout(None)
+        # Blocking mode alone would miss a link that goes silently dead (relay
+        # box drops off the internet, LAN cable pulled) for minutes at a time
+        # (OS TCP defaults); keepalive bounds that to a few seconds instead.
+        enable_keepalive(local)
+        enable_keepalive(relay_sock)
         _splice(relay_sock, local, a_to_b=viewer_preload)

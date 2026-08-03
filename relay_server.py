@@ -102,6 +102,45 @@ class _Waiters:
 _waiters = _Waiters()
 
 
+def _enable_keepalive(sock, idle=10, interval=3, count=3):
+    """Detect a genuinely dead peer within ~idle+interval*count seconds. The only
+    dead-link signal a spliced connection has: with the handshake read-timeout
+    cleared (see _prime_for_splice), a silent-but-alive direction must NOT be
+    mistaken for a dead one, so keepalive does that job instead."""
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    except OSError:
+        return
+    if sys.platform == "win32":
+        try:
+            sock.ioctl(socket.SIO_KEEPALIVE_VALS, (1, idle * 1000, interval * 1000))
+        except (AttributeError, OSError):
+            pass
+    else:
+        for opt, val in ((getattr(socket, "TCP_KEEPIDLE", None), idle),
+                         (getattr(socket, "TCP_KEEPINTVL", None), interval),
+                         (getattr(socket, "TCP_KEEPCNT", None), count)):
+            if opt is not None:
+                try:
+                    sock.setsockopt(socket.IPPROTO_TCP, opt, val)
+                except OSError:
+                    pass
+
+
+def _prime_for_splice(*socks):
+    """Hand both legs of a splice off to blocking mode with keepalive. _recv_line
+    left a 20s read-timeout on each socket for the handshake; carried into the
+    splice it would fire on any direction that stays quiet for 20s -- e.g. the
+    viewer->host leg of audio/screen, which is one-way, so the whole session was
+    being torn down every ~20s. Clear it and rely on keepalive for real deaths."""
+    for s in socks:
+        try:
+            s.settimeout(None)
+        except OSError:
+            pass
+        _enable_keepalive(s)
+
+
 def _pump(src, dst, preload=b""):
     try:
         if preload:
@@ -161,6 +200,7 @@ def _handle_host(sock, room, channel):
             pass
         return
     _log(f"paired       room={room} channel={channel}")
+    _prime_for_splice(sock, viewer)
     _splice(sock, viewer)
     _log(f"closed       room={room} channel={channel}")
 

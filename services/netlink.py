@@ -27,6 +27,7 @@ import socket
 import threading
 
 from logsetup import get_logger
+from services.sockopt import enable_keepalive
 
 # --- protocol constants ---
 DISCOVERY_PORT = 48920      # UDP beacon port (Host -> LAN broadcast)
@@ -364,6 +365,7 @@ class NetServer:
             self._remember_approved(vid, peer["name"])
             self._safe_send(conn, {"type": "welcome", "name": self.name,
                                    "in_meeting": self.in_meeting, "resume": token})
+            enable_keepalive(conn)
             with self._lock:
                 self._clients.append(conn)
             get_logger().info("net: viewer connected from %s (name=%r)",
@@ -551,6 +553,12 @@ class NetClient:
             backoff = 1.0
             self._sock = sock
             try:
+                # The direct (non-relay) branch above came from create_connection(),
+                # which leaves its connect-phase timeout on the socket afterward;
+                # _session_loop sets its own poll timeout before reading, but reset
+                # here too so the same is true for both the relay and direct paths.
+                sock.settimeout(None)
+                enable_keepalive(sock)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             except OSError:
                 pass
@@ -970,6 +978,14 @@ class NetController:
 
     def _try_upnp(self, port, protocol="TCP"):
         """Best-effort automatic router port-opening (runs off the GUI thread)."""
+        # With the relay enabled, viewers reach this host by ID via OUTBOUND
+        # connections to the relay -- no inbound router port is needed, so the UPnP
+        # attempt is pointless here. Skip it instead of spending ~3s per port on
+        # SSDP discovery and then logging a failure that doesn't matter.
+        if self.relay_enabled:
+            get_logger().debug("upnp: skipping %s port %d (relay enabled)",
+                               protocol, port)
+            return
         try:
             from services import upnp
             external_ip, err = upnp.add_port_mapping(port, local_ip(), protocol=protocol)

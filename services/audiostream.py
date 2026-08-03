@@ -27,14 +27,17 @@ import numpy as np
 from config import CAPTURE_SR
 from logsetup import get_logger
 from services.audio_utils import find_loopback, find_microphone, resample
+from services.sockopt import enable_keepalive
 
 AUDIO_SR = 48000                              # streamed sample rate (mono, Opus-native)
 FRAME_MS = 20
 FRAME_SAMPLES = AUDIO_SR * FRAME_MS // 1000   # 960 samples per frame
 CAP_BLOCK = 1024                              # device capture block size
 MAX_LAG = AUDIO_SR                            # ~1 s per buffer -> bounds latency
-OPUS_BITRATE = 24000                          # ~24-40 kbps VBR (voice)
+OPUS_BITRATE = 48000                          # ~48-64 kbps VBR (voice + system mix)
 SNDBUF = 64 * 1024
+AUDIO_LIVENESS = 10.0   # no packet for this long -> reconnect the audio socket
+DENOISE = True          # spectral noise suppression on the mix before encoding
 
 MT_AUTH = 1      # Viewer -> Host: json {token}
 MT_AUDIO = 2     # Host -> Viewer: one Opus packet
@@ -187,6 +190,7 @@ class AudioServer:
                 conn.close()
                 return
             conn.settimeout(None)
+            enable_keepalive(conn)
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             try:
                 conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SNDBUF)
@@ -195,6 +199,10 @@ class AudioServer:
 
             from services.acodec import OpusEncoder
             encoder = OpusEncoder(AUDIO_SR, bitrate=OPUS_BITRATE)
+            denoiser = None
+            if DENOISE:
+                from services.denoise import SpectralDenoiser
+                denoiser = SpectralDenoiser(FRAME_SAMPLES)
             loop = _Capture("loopback"); loop.start()
             mic = _Capture("mic"); mic.start()
             get_logger().info("audio: streaming (loopback + mic, Opus) to %s", addr[0])
@@ -202,8 +210,11 @@ class AudioServer:
             interval = FRAME_MS / 1000.0
             next_t = time.monotonic()
             while not self._stop.is_set():
-                mixed = np.clip(loop.fifo.read(FRAME_SAMPLES) +
-                                mic.fifo.read(FRAME_SAMPLES), -1.0, 1.0)
+                frame = (loop.fifo.read(FRAME_SAMPLES) +
+                         mic.fifo.read(FRAME_SAMPLES))
+                if denoiser is not None:
+                    frame = denoiser.process(frame)
+                mixed = np.tanh(frame)
                 pcm16 = (mixed * 32767).astype(np.int16)
                 try:
                     for pkt in encoder.encode(pcm16):
@@ -217,7 +228,7 @@ class AudioServer:
                 else:
                     next_t = time.monotonic()   # fell behind -> reset the cadence
         except Exception:
-            get_logger().debug("audio: session error", exc_info=True)
+            get_logger().exception("audio: session error")
         finally:
             if loop is not None:
                 loop.stop()
@@ -253,19 +264,12 @@ class AudioClient:
         self.connect = connect          # () -> connected socket (relay mode)
         self.on_status = on_status
         self._stop = threading.Event()
-        self._muted = threading.Event()
         self._sock = None
         self._fifo = _SampleFIFO(MAX_LAG)
 
     def start(self):
         threading.Thread(target=self._run, daemon=True).start()
         threading.Thread(target=self._play_loop, daemon=True).start()
-
-    def set_muted(self, muted):
-        if muted:
-            self._muted.set()
-        else:
-            self._muted.clear()
 
     def stop(self):
         self._stop.set()
@@ -297,6 +301,15 @@ class AudioClient:
             backoff = 1.0
             self._sock = sock
             try:
+                # The direct (non-relay) branch above came from create_connection(),
+                # which leaves its connect-phase timeout on the socket afterward --
+                # left in place, a quiet moment during normal use reads as a dead
+                # peer and drops a fine link.
+                sock.settimeout(None)
+                # Blocking mode alone would miss a link gone silently dead (cable
+                # pulled, Wi-Fi drops uncleanly) for minutes at a time (OS TCP
+                # defaults); keepalive bounds that to a few seconds instead.
+                enable_keepalive(sock)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 _send(sock, MT_AUTH, json.dumps({"token": self.token}).encode("utf-8"))
             except OSError:
@@ -314,17 +327,21 @@ class AudioClient:
         from services.acodec import OpusDecoder
         decoder = OpusDecoder(AUDIO_SR)
         try:
-            sock.settimeout(10)
+            sock.settimeout(AUDIO_LIVENESS)
         except OSError:
             return
         while not self._stop.is_set():
             try:
                 mtype, data = _recv(sock)
             except socket.timeout:
+                get_logger().info("audio: no packet for %.0fs -> reconnecting",
+                                  AUDIO_LIVENESS)
                 return
             except OSError:
+                get_logger().info("audio: socket error -> reconnecting")
                 return
             if mtype is None:
+                get_logger().info("audio: host closed the connection -> reconnecting")
                 return
             if mtype != MT_AUDIO:
                 continue
@@ -345,11 +362,7 @@ class AudioClient:
                 while not self._stop.is_set():
                     # read() paces itself only when data exists; player.play blocks
                     # ~one frame of real time, so playback stays near real time.
-                    # Always drain the FIFO so it doesn't back up; when muted,
-                    # play silence so the host's voice never reaches the speaker.
                     frame = self._fifo.read(FRAME_SAMPLES).reshape(-1, 1)
-                    if self._muted.is_set():
-                        frame = np.zeros_like(frame)
                     player.play(frame)
         except Exception:
             get_logger().exception("audio: playback failed")

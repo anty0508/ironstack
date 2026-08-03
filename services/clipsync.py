@@ -15,10 +15,18 @@ Framing: [1-byte type][4-byte big-endian length][payload]
                    MT_IMAGE  PNG bytes
                    MT_FILES  json header, NUL, then the files' bytes back to back
                              (header: [{"name": str, "size": int}, ...])
+                   MT_PING   empty -- keepalive; the peer just discards it
+
+Unlike the screen/audio streams, this channel is idle by nature (nothing to
+send until the clipboard actually changes), so without traffic a NAT/firewall/
+relay along the way can quietly kill it for inactivity. MT_PING every few
+seconds (see ClipboardSyncController._keepalive) keeps it looking alive, the
+same job the control channel's "__ping"/"__pong" does for itself.
 """
 
 import os
 import json
+import time
 import struct
 import socket
 import hashlib
@@ -28,11 +36,20 @@ import threading
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from logsetup import get_logger
+from services.sockopt import enable_keepalive
 
 MT_AUTH = 1
 MT_TEXT = 2
 MT_IMAGE = 3
 MT_FILES = 4
+MT_PING = 5
+
+KEEPALIVE_INTERVAL_MS = 3000   # same cadence as the control channel's __ping
+
+# A connection alive for less than this is treated as a failed attempt (see
+# ClipboardClient._run), not a real session -- so a peer that accepts then
+# immediately drops can't spin into a zero-delay reconnect storm.
+_MIN_STABLE_CONN_S = 2.0
 
 # Clipboard content over this is skipped (logged), never sent -- a huge file
 # copy should never stall the link or fill the receiving side's disk.
@@ -191,8 +208,22 @@ class ClipboardSyncController(QtCore.QObject):
         self._clipboard.dataChanged.connect(self._on_local_change)
         self._new_peer.connect(self._push_current_to)
         self._apply_request.connect(self._apply_incoming)
+        # This channel is idle by nature (nothing to send until the clipboard
+        # changes), unlike the always-flowing screen/audio streams -- so without
+        # traffic, a NAT/firewall/relay along the way can quietly kill it for
+        # inactivity. A periodic no-op keeps every connection looking alive.
+        self._keepalive = QtCore.QTimer(self)
+        self._keepalive.setInterval(KEEPALIVE_INTERVAL_MS)
+        self._keepalive.timeout.connect(self._send_keepalive)
+        self._keepalive.start()
 
     # --- connection management ---
+
+    def _send_keepalive(self):
+        with self._lock:
+            conns = list(self._conns)
+        for conn in conns:
+            self._send_to(conn, MT_PING, b"")
 
     def add_peer(self, conn):
         with self._lock:
@@ -330,6 +361,7 @@ class ClipboardServer:
                 conn.close()
                 return
             conn.settimeout(None)
+            enable_keepalive(conn)
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             get_logger().info("clipboard: viewer connected from %s", addr[0])
             get_clipboard_sync_controller().add_peer(conn)
@@ -390,9 +422,17 @@ class ClipboardClient:
                     return
                 backoff = min(backoff * 2, 5.0)
                 continue
-            backoff = 1.0
             self._sock = sock
             try:
+                # The direct (non-relay) branch above came from create_connection(),
+                # which leaves its connect-phase timeout on the socket afterward --
+                # left in place, a quiet moment during normal use (keepalive delayed
+                # by a busy GUI thread) reads as a dead peer and drops a fine link.
+                sock.settimeout(None)
+                # Blocking mode alone would miss a link gone silently dead (cable
+                # pulled, Wi-Fi drops uncleanly) for minutes at a time (OS TCP
+                # defaults); keepalive bounds that to a few seconds instead.
+                enable_keepalive(sock)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 _send(sock, MT_AUTH, json.dumps({"token": self.token}).encode("utf-8"))
             except OSError:
@@ -402,8 +442,10 @@ class ClipboardClient:
                     pass
                 if self._stop.wait(backoff):
                     return
+                backoff = min(backoff * 2, 5.0)
                 continue
             get_logger().info("clipboard: connected to host")
+            connected_at = time.monotonic()
             get_clipboard_sync_controller().add_peer(sock)
             # Block here for as long as this connection is alive.
             # ClipboardSyncController's own recv loop closes the socket (so
@@ -413,3 +455,15 @@ class ClipboardClient:
             if self._stop.is_set():
                 return
             get_logger().info("clipboard: disconnected, reconnecting…")
+            if time.monotonic() - connected_at < _MIN_STABLE_CONN_S:
+                # Died right away (stale relay pairing, host not ready yet):
+                # throttle like a failed connect. Without this, a connection that
+                # keeps getting accepted-then-dropped spins into a zero-delay
+                # reconnect loop -- each iteration also re-pushes the whole
+                # clipboard to the new peer, which floods the GUI thread with
+                # snapshot work and reads as a total freeze.
+                if self._stop.wait(backoff):
+                    return
+                backoff = min(backoff * 2, 5.0)
+            else:
+                backoff = 1.0

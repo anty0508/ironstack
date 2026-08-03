@@ -87,6 +87,7 @@ class _ScreenView(QtWidgets.QWidget):
 
     def paintEvent(self, _e):
         p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.SmoothPixmapTransform, True)
         p.fillRect(self.rect(), Qt.black)
         if self._img is None:
             if self._status_text:
@@ -184,7 +185,7 @@ class RemoteView(QtWidgets.QWidget):
     closed = QtCore.Signal()
 
     def __init__(self, host, send_input, connect_screen=None, on_open_transcript=None,
-                 on_toggle_mute=None):
+                 on_toggle_mute=None, on_toggle_clip=None):
         super().__init__()
         self.setWindowTitle("IronStack — Remote")
         # Use the IronStack icon (this is a separate top-level window, so give it
@@ -210,6 +211,7 @@ class RemoteView(QtWidgets.QWidget):
         self._send_input_cb = send_input
         self._on_open_transcript = on_open_transcript
         self._on_toggle_mute = on_toggle_mute
+        self._on_toggle_clip = on_toggle_clip
         self._client = None
         self._quality = "high"
         self._view_only = False
@@ -326,9 +328,16 @@ class RemoteView(QtWidgets.QWidget):
     def _toggle_mute(self, muted):
         self._mute_btn.setText("🔇" if muted else "🔊")
         self._mute_btn.setToolTip(
-            "Unmute the host's audio" if muted else "Mute the host's audio")
+            "Turn the host's audio back on" if muted else "Turn off the host's audio")
         if self._on_toggle_mute is not None:
             self._on_toggle_mute(muted)
+
+    def _toggle_clip(self, on):
+        self._clip_btn.setToolTip(
+            "Stop syncing clipboard with the host" if on
+            else "Sync clipboard with the host")
+        if self._on_toggle_clip is not None:
+            self._on_toggle_clip(on)
 
     # ---- layout ----
     def _build_ui(self):
@@ -370,6 +379,14 @@ class RemoteView(QtWidgets.QWidget):
         self._mute_btn.setToolTip("Mute the host's audio")
         self._mute_btn.toggled.connect(self._toggle_mute)
         h.addWidget(self._mute_btn)
+
+        # Off by default: clipboard sync only starts once the user opts in here.
+        self._clip_btn = QtWidgets.QPushButton("📋")
+        self._clip_btn.setCheckable(True)
+        self._clip_btn.setCursor(Qt.PointingHandCursor)
+        self._clip_btn.setToolTip("Sync clipboard with the host")
+        self._clip_btn.toggled.connect(self._toggle_clip)
+        h.addWidget(self._clip_btn)
 
         self._viewonly_btn = QtWidgets.QPushButton("View only")
         self._viewonly_btn.setCheckable(True)

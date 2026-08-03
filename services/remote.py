@@ -27,6 +27,7 @@ from logsetup import get_logger
 from services import screencap
 from services.vcodec import H264Encoder, H264Decoder
 from services.inputinject import detect_cursor
+from services.sockopt import enable_keepalive
 
 DEFAULT_FPS = 20
 SNDBUF = 512 * 1024      # small send buffer -> bounds in-flight latency
@@ -136,6 +137,7 @@ class RemoteScreenServer:
                 conn.close()
                 return
             conn.settimeout(None)
+            enable_keepalive(conn)
             conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
             try:
                 conn.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, SNDBUF)
@@ -254,6 +256,12 @@ class RemoteScreenClient:
             backoff = 1.0
             self._sock = sock
             try:
+                # The direct (non-relay) branch above came from create_connection(),
+                # which leaves its connect-phase timeout on the socket afterward;
+                # _recv_loop sets its own liveness timeout before reading, but reset
+                # here too so the same is true for both the relay and direct paths.
+                sock.settimeout(None)
+                enable_keepalive(sock)
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
                 _send(sock, MT_AUTH, json.dumps(
                     {"token": self.token, "monitor_id": self.monitor_id,

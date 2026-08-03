@@ -748,18 +748,34 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
         overlay.raise_()
         overlay.activateWindow()
 
-    # Live meeting audio played on this PC's speakers (one client, re-offered on
-    # each (re)connect so it always uses a fresh token).
-    audio = {"client": None, "muted": False}
-    # Clipboard sync client (one at a time, re-offered on each (re)connect).
-    clip = {"client": None}
+    # Live meeting audio played on this PC's speakers, and clipboard sync: each is
+    # one client at a time, re-offered on each (re)connect so it always uses a
+    # fresh token. `enabled` is the user's on/off choice via the toolbar buttons
+    # (audio defaults on, clipboard defaults off) and survives a control-channel
+    # reconnect -- see on_status's "connected" branch below, which only re-asks
+    # the host for the ones currently enabled.
+    audio = {"client": None, "enabled": True}
+    clip = {"client": None, "enabled": False}
 
-    # Mute the host's live audio locally (client-side only; the host keeps
-    # transcribing). State is remembered so it survives audio reconnects.
+    # Audio on/off: actually tears down and re-dials the socket (not just local
+    # muting), so turning it off actually stops the stream instead of just
+    # silencing playback.
     def on_mute_toggled(muted):
-        audio["muted"] = muted
-        if audio["client"] is not None:
-            audio["client"].set_muted(muted)
+        audio["enabled"] = not muted
+        if not muted:
+            client.send({"type": "cmd", "action": "audio_start"})
+        elif audio["client"] is not None:
+            audio["client"].stop()
+            audio["client"] = None
+
+    # Clipboard on/off: off by default -- nothing syncs until the user opts in.
+    def on_clip_toggled(on):
+        clip["enabled"] = on
+        if on:
+            client.send({"type": "cmd", "action": "clip_start"})
+        elif clip["client"] is not None:
+            clip["client"].stop()
+            clip["client"] = None
 
     # The primary window: the host's screen. Opens now, before anything connects.
     remote = RemoteView(
@@ -767,13 +783,16 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
         send_input=lambda ev: client.send({"type": "input", **ev}),
         connect_screen=screen_connect,
         on_open_transcript=show_transcript,
-        on_toggle_mute=on_mute_toggled)
+        on_toggle_mute=on_mute_toggled,
+        on_toggle_clip=on_clip_toggled)
     remote.set_connection_status("Connecting to relay server…")
     remote.show()
     if tray is not None:
         tray.set_window(remote)
 
     def open_audio(msg):
+        if not audio["enabled"]:
+            return   # turned off again while the offer was in flight
         try:
             from services.audiostream import AudioClient
             if audio["client"] is not None:
@@ -782,13 +801,14 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
                 room, 0, msg.get("token"),
                 connect=lambda: relaylink.dial_via_relay(rhost, rport, room, "audio"),
                 on_status=lambda s: get_logger().info("viewer audio: %s", s))
-            ac.set_muted(audio["muted"])   # carry the mute state across reconnects
             ac.start()
             audio["client"] = ac
         except Exception:
             get_logger().exception("audio: could not start playback (deps missing?)")
 
     def open_clip(msg):
+        if not clip["enabled"]:
+            return   # turned off again while the offer was in flight
         try:
             if clip["client"] is not None:
                 clip["client"].stop()
@@ -848,8 +868,10 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
             remote.set_connection_status("Connected")
             overlay.set_connected(True)     # host accepted -> open the shared notepad
             client.send({"type": "cmd", "action": "remote_start"})  # show the screen
-            client.send({"type": "cmd", "action": "audio_start"})   # hear the meeting
-            client.send({"type": "cmd", "action": "clip_start"})    # sync clipboards
+            if audio["enabled"]:
+                client.send({"type": "cmd", "action": "audio_start"})   # hear the meeting
+            if clip["enabled"]:
+                client.send({"type": "cmd", "action": "clip_start"})    # sync clipboards
         elif low.startswith("waiting"):
             remote.set_connection_status("Connecting to host…")
         elif low.startswith("denied"):
@@ -914,6 +936,8 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
         pass
     if audio["client"] is not None:
         audio["client"].stop()
+    if clip["client"] is not None:
+        clip["client"].stop()
     client.stop()
     recorder.finalize()   # flush any half-streamed answer (client thread is stopped)
     overlay.shutdown()
