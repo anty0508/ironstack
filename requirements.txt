@@ -6,6 +6,7 @@ openai
 PySide6
 pypdf
 python-docx
+pypinyin  # pronunciation lines under Chinese answers
 
 # Remote screen view/control
 av         # PyAV: H.264 encode/decode for the screen stream

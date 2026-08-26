@@ -20,6 +20,7 @@ import sys
 from ctypes import wintypes
 
 from PySide6 import QtCore, QtWidgets
+from pypinyin import pinyin, Style
 
 from config import LANGUAGES, DEFAULT_LANGUAGE_CODE
 from logsetup import get_logger
@@ -1168,7 +1169,22 @@ class Overlay(QtWidgets.QWidget):
     # Generous leading + a clear gap after each block, so a long answer is easy
     # to scan and you don't lose your place between lines.
     _P_STYLE = "margin:0 0 0.6em 0; line-height:160%"
+    _P_STYLE_TIGHT = "margin:0; line-height:160%"
     _LI_STYLE = "margin-bottom:0.4em"
+    _LI_STYLE_TIGHT = "margin-bottom:0"
+    _PINYIN_STYLE = "margin:0 0 0.6em 0; line-height:130%; font-size:11px; color:#8a90a2"
+    _PINYIN_STYLE_LI = "margin:0 0 0.4em 0; line-height:130%; font-size:11px; color:#8a90a2"
+
+    _CJK_RE = re.compile(r"[一-鿿]")
+
+    @classmethod
+    def _pinyin_line(cls, text):
+        """Space-separated pronunciation for a line of Chinese text, or "" if the
+        line has no Chinese characters (e.g. an English aside) to annotate."""
+        if not cls._CJK_RE.search(text):
+            return ""
+        syllables = pinyin(text, style=Style.TONE)
+        return " ".join(s[0] for s in syllables)
 
     @staticmethod
     def _split_sentences(text):
@@ -1178,11 +1194,14 @@ class Overlay(QtWidgets.QWidget):
         parts = re.split(r"(?<=[.!?…])\s+|(?<=[。！？])", text)
         return [p for p in (s.strip() for s in parts) if p]
 
-    @staticmethod
-    def _format_answer(text):
+    @classmethod
+    def _format_answer(cls, text, language_code=None):
         """Render the model's lightly marked-up answer as easy-to-read rich text:
         each sentence on its own spaced line, plus bullet / numbered lists,
-        **bold**, and `code`."""
+        **bold**, and `code`. When the answer language is Chinese, a smaller
+        pronunciation (pinyin) line is added under each line of Chinese text."""
+
+        show_pinyin = language_code == "zh"
 
         def inline(s):
             s = html.escape(s)
@@ -1199,6 +1218,20 @@ class Overlay(QtWidgets.QWidget):
                 parts.append(f"</{list_type}>")
                 list_type = None
 
+        def emit_li(raw_line):
+            pron = cls._pinyin_line(raw_line) if show_pinyin else ""
+            li_style = Overlay._LI_STYLE_TIGHT if pron else Overlay._LI_STYLE
+            parts.append(f'<li style="{li_style}">{inline(raw_line)}</li>')
+            if pron:
+                parts.append(f'<li style="{Overlay._PINYIN_STYLE_LI}; list-style:none">{html.escape(pron)}</li>')
+
+        def emit_sentence(raw_sentence):
+            pron = cls._pinyin_line(raw_sentence) if show_pinyin else ""
+            p_style = Overlay._P_STYLE_TIGHT if pron else Overlay._P_STYLE
+            parts.append(f'<p style="{p_style}">{inline(raw_sentence)}</p>')
+            if pron:
+                parts.append(f'<p style="{Overlay._PINYIN_STYLE}">{html.escape(pron)}</p>')
+
         for raw in text.split("\n"):
             line = raw.strip()
             if not line:
@@ -1209,17 +1242,17 @@ class Overlay(QtWidgets.QWidget):
             if m_ul:
                 if list_type != "ul":
                     close_list(); parts.append("<ul>"); list_type = "ul"
-                parts.append(f'<li style="{Overlay._LI_STYLE}">{inline(m_ul.group(1))}</li>')
+                emit_li(m_ul.group(1))
             elif m_ol:
                 if list_type != "ol":
                     close_list(); parts.append("<ol>"); list_type = "ol"
-                parts.append(f'<li style="{Overlay._LI_STYLE}">{inline(m_ol.group(1))}</li>')
+                emit_li(m_ol.group(1))
             else:
                 close_list()
                 # One sentence per spaced line keeps even a long, unbroken answer
                 # readable (the model often emits a single dense paragraph).
                 for sentence in Overlay._split_sentences(line):
-                    parts.append(f'<p style="{Overlay._P_STYLE}">{inline(sentence)}</p>')
+                    emit_sentence(sentence)
         close_list()
         return "".join(parts)
 
@@ -1354,7 +1387,7 @@ class Overlay(QtWidgets.QWidget):
             self._current_body.setTextFormat(Qt.RichText)
             self._answer_text = ""
         self._answer_text += delta
-        self._current_body.setText(self._format_answer(self._answer_text))
+        self._current_body.setText(self._format_answer(self._answer_text, self._language_code))
         self._scroll_to_top()
 
     @QtCore.Slot(str)
