@@ -1,0 +1,42 @@
+[Unit]
+Description=IronStack relay server
+Documentation=https://github.com/anty0508/ironstack
+# Only start once the box actually has a routable network.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=anty
+# Adjust if you cloned the repo somewhere other than the anty home dir.
+WorkingDirectory=/home/anty/ironstack
+ExecStart=/usr/bin/python3 /home/anty/ironstack/relay_server.py --port 48920
+
+# --- This is the actual "stable server": always come back. ---
+# If the process exits for ANY reason (crash, OOM kill, an unhandled error that
+# slips past the in-process guards), restart it. RestartSec avoids a hot crash-loop.
+Restart=always
+RestartSec=2
+# If it somehow crash-loops, back off instead of hammering: >5 starts in 60s -> pause.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# The relay is fd-bound: every parked and every active connection is an open socket.
+# The default 1024 soft limit is easily hit, and hitting it is exactly what used to
+# kill the old server. Give it plenty of headroom.
+LimitNOFILE=1048576
+
+# Contain a runaway before it takes the whole box down. The relay is a byte pipe with
+# a bounded connection cap, so its steady-state memory is small; if it blows past this
+# something is wrong and a restart is the right cure.
+MemoryMax=512M
+TasksMax=8192
+
+# Minor hardening -- the relay needs no privileges and writes nothing to disk.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+
+[Install]
+WantedBy=multi-user.target

@@ -47,7 +47,17 @@ PING_INTERVAL = 15.0      # seconds between heartbeats to a parked host connecti
 VIEWER_WAIT = 8.0         # how long to wait for a ready host conn before telling
                           # the viewer "host not connected" (< the client's dial
                           # timeout, so the error arrives instead of a timeout)
+HANDSHAKE_DEADLINE = 20.0  # absolute cap on reading the first handshake line, so a
+                           # client that opens a socket and then dribbles (or never
+                           # sends) can't pin a thread + fd forever (slow-loris)
+MAX_CONNS = 4096          # soft cap on concurrent connections; past this the relay
+                          # drops new ones instead of marching into fd exhaustion.
+                          # A host parks ~7-9 conns, so this is ~450 live hosts.
 BUFSIZE = 65536
+
+# Sized in serve(); a BoundedSemaphore that gates how many connections may be
+# in flight at once. None until serve() runs (e.g. under unit tests).
+_conn_gate = None
 
 
 def _log(*a):
@@ -58,12 +68,18 @@ def _send_line(sock, obj):
     sock.sendall((json.dumps(obj) + "\n").encode("utf-8"))
 
 
-def _recv_line(sock, timeout=20.0, limit=65536):
+def _recv_line(sock, timeout=HANDSHAKE_DEADLINE, limit=65536):
     """Read one newline-framed line WITHOUT over-reading past it (byte at a time),
-    so the bytes that follow belong cleanly to the spliced stream."""
-    sock.settimeout(timeout)
+    so the bytes that follow belong cleanly to the spliced stream. `timeout` is an
+    ABSOLUTE deadline across the whole line -- not per-recv -- so a peer that dribbles
+    one byte just under the per-recv timeout can't hold the connection open forever."""
+    deadline = time.monotonic() + timeout
     buf = bytearray()
     while b"\n" not in buf:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        sock.settimeout(remaining)
         chunk = sock.recv(1)
         if not chunk:
             break
@@ -175,6 +191,11 @@ def _splice(a, b, a_to_b=b"", b_to_a=b""):
 def _handle_host(sock, room, channel):
     key = (room, channel)
     item = {"sock": sock, "viewer": None, "claimed": threading.Event()}
+    # Keepalive on the PARKED socket too: the {"ping":1} below is tiny and, on a
+    # peer that dropped off without a RST, buffers silently for a long time before
+    # sendall() ever fails -- so without this a dead parked conn (and its fd +
+    # thread) can linger for minutes. Keepalive bounds that to a few seconds.
+    _enable_keepalive(sock)
     _waiters.put(key, item)
     _log(f"host ready   room={room} channel={channel}")
     # Heartbeat while parked so a CGNAT/VPN mapping stays open; also detects death.
@@ -258,26 +279,74 @@ def _handle(sock):
         _log("session error:", exc)
 
 
-def serve(host, port):
+def _handle_gated(sock):
+    """Run _handle, then always free the connection slot back to the gate."""
+    try:
+        _handle(sock)
+    finally:
+        if _conn_gate is not None:
+            try:
+                _conn_gate.release()
+            except ValueError:   # released more than acquired -- shouldn't happen
+                pass
+
+
+def serve(host, port, max_conns=MAX_CONNS):
+    global _conn_gate
+    _conn_gate = threading.BoundedSemaphore(max_conns) if max_conns > 0 else None
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((host, port))
-    srv.listen(64)
-    _log(f"listening on {host}:{port}")
+    srv.listen(128)
+    _log(f"listening on {host}:{port} (max_conns={max_conns})")
     while True:
-        conn, addr = srv.accept()
-        threading.Thread(target=_handle, args=(conn,), daemon=True).start()
+        try:
+            conn, addr = srv.accept()
+        except OSError as exc:
+            # A transient accept() failure must NOT take the relay down: fd
+            # exhaustion (EMFILE/ENFILE), ECONNABORTED, a momentary ENOBUFS. Log,
+            # breathe so we don't spin hot while fds are still scarce, keep serving.
+            _log("accept failed:", exc)
+            time.sleep(0.1)
+            continue
+        # Cap in-flight connections so a flood (or a leak elsewhere) can't march the
+        # whole box into fd exhaustion -- drop the new one instead of dying.
+        if _conn_gate is not None and not _conn_gate.acquire(blocking=False):
+            _log("at capacity, dropping", addr)
+            try:
+                conn.close()
+            except OSError:
+                pass
+            continue
+        try:
+            threading.Thread(target=_handle_gated, args=(conn,), daemon=True).start()
+        except RuntimeError as exc:   # "can't start new thread" -> OS thread limit
+            _log("thread start failed:", exc)
+            if _conn_gate is not None:
+                _conn_gate.release()
+            try:
+                conn.close()
+            except OSError:
+                pass
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="IronStack relay server")
     ap.add_argument("--host", default="0.0.0.0", help="bind address (default 0.0.0.0)")
     ap.add_argument("--port", type=int, default=48920, help="TCP port (default 48920)")
+    ap.add_argument("--max-conns", type=int, default=MAX_CONNS,
+                    help=f"cap on concurrent connections (default {MAX_CONNS}; 0=unlimited)")
     args = ap.parse_args(argv)
     try:
-        serve(args.host, args.port)
+        serve(args.host, args.port, args.max_conns)
     except KeyboardInterrupt:
         _log("shutting down")
+        return 0
+    except Exception as exc:   # noqa: BLE001 -- last-resort guard; a supervisor
+        # (systemd Restart=always) brings us straight back. Better to exit non-zero
+        # and be restarted clean than to wedge in a half-broken state.
+        _log("fatal:", exc)
+        return 1
     return 0
 
 
