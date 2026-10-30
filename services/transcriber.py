@@ -21,6 +21,7 @@ from config import (
     UTTERANCE_END_MS,
 )
 from services.audio_utils import find_loopback, find_microphone, resample
+from services.audiostream import viewer_mic_active
 from logsetup import get_logger
 
 
@@ -96,6 +97,18 @@ class Transcriber:
         except queue.Empty:
             pass
 
+    def push_pcm(self, samples, sample_rate):
+        """Inject mono float32 audio into this transciber (e.g. Viewer mic when
+        it replaces the Host mic for meeting + "You" text)."""
+        if self.stop_event.is_set():
+            return
+        mono = np.asarray(samples, dtype=np.float32).reshape(-1)
+        if mono.size == 0:
+            return
+        mono = resample(mono, int(sample_rate), TARGET_SR)
+        mono = np.clip(mono, -1.0, 1.0)
+        self.audio_queue.put((mono * 32767).astype(np.int16).tobytes())
+
     # --- audio capture (runs in its own thread) ---
 
     def _capture_worker(self):
@@ -128,6 +141,10 @@ class Transcriber:
             ) as recorder:
                 while not self.stop_event.is_set():
                     data = recorder.record(numframes=BLOCK_FRAMES)
+
+                    # Mic ON: "You" comes from client mic via push_pcm, not host mic.
+                    if self.source == "microphone" and viewer_mic_active():
+                        continue
 
                     # Average to mono. record() returns shape (frames, channels),
                     # so this collapses cleanly whether channels is 1 or 2.

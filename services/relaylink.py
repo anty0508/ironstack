@@ -31,7 +31,7 @@ from services.sockopt import enable_keepalive
 RELAY_DEFAULT_PORT = 48920
 # How many idle "ready" connections to keep parked per channel. A couple is plenty
 # for this app (usually one or two viewers); each is replaced the instant it's used.
-POOL = {"control": 3, "screen": 2, "audio": 2}
+POOL = {"control": 3, "screen": 2, "audio": 2, "clip": 2, "mic": 2}
 _HOST_STALE = 60.0   # if no relay heartbeat within this, treat a parked conn as dead
 
 

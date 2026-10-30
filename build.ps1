@@ -46,6 +46,8 @@ python -m PyInstaller --noconfirm --clean `
     --icon assets\IronStack.ico `
     --add-data "assets\IronStack.ico;assets" `
     --add-data ".env;." `
+    --add-data "vendor\vbcable\VBCABLE_Driver_Pack45.zip;vendor\vbcable" `
+    --add-data "vendor\vbcable\NOTICE.txt;vendor\vbcable" `
     --collect-data soundcard `
     --collect-all av `
     @uac `

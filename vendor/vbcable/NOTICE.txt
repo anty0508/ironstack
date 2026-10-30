@@ -1,0 +1,14 @@
+VB-CABLE Virtual Audio Device
+Copyright Vincent Burel / VB-Audio Softwares
+https://vb-cable.com
+https://vb-audio.com/Services/licensing.htm
+
+VB-CABLE is donationware. All participations are welcome.
+
+IronStack ships the official, unmodified VBCABLE_Driver_Pack45.zip and can
+launch VB-Audio's own installer so viewer microphone audio can be injected
+into the host's meeting microphone path (CABLE Input -> CABLE Output).
+
+Per VB-Audio licensing, the donationware model remains applicable: end users
+can identify VB-CABLE and may donate/pay at https://vb-cable.com if they find
+it useful.

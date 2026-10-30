@@ -11,6 +11,8 @@ import html
 
 from pathlib import Path
 
+import soundcard as sc
+
 from PySide6 import QtCore, QtWidgets
 
 Qt = QtCore.Qt
@@ -35,6 +37,7 @@ NAV = [
     ("project", "Projects"),
     ("reference", "References"),
     ("preferences", "Preferences"),
+    ("audio", "Audio"),
     ("network", "Network"),
     ("history", "Past meetings"),
 ]
@@ -152,7 +155,11 @@ class FilePicker(QtWidgets.QDialog):
 
     def __init__(self, title, start_dir=None, parent=None):
         super().__init__(parent)
-        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog)
+        # WindowStaysOnTopHint (+ native topmost in showEvent) so this picker is
+        # never buried under the pinned setup window — without it, Import…
+        # opens the dialog behind the launcher and the user can't click it.
+        self.setWindowFlags(Qt.FramelessWindowHint | Qt.Dialog | Qt.Tool
+                            | Qt.WindowStaysOnTopHint)
         # Opaque (not WA_TranslucentBackground) with square corners, so the
         # window stays hidden when capture exclusion is on. A frameless
         # translucent window is invisible to WDA_EXCLUDEFROMCAPTURE on some GPUs.
@@ -183,6 +190,25 @@ class FilePicker(QtWidgets.QDialog):
         screen = QtWidgets.QApplication.primaryScreen().availableGeometry()
         self.move(screen.center().x() - self.width() // 2,
                   screen.center().y() - self.height() // 2)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        # Same treatment as MessageDialog: raise above the always-on-top
+        # launcher and assert native HWND_TOPMOST so Windows doesn't leave
+        # this dialog stuck underneath the pinned setup window.
+        parent = self.parent()
+        ref = (parent.frameGeometry() if parent is not None and parent.isVisible()
+               else QtWidgets.QApplication.primaryScreen().availableGeometry())
+        self.move(ref.center().x() - self.width() // 2,
+                  ref.center().y() - self.height() // 2)
+        apply_exclude_from_capture(
+            self, enabled=get_window_visibility_controller().capture_excluded)
+        self.raise_()
+        self.activateWindow()
+        try:
+            set_window_topmost(self, True)
+        except Exception:
+            pass
 
     def _build(self, title):
         shell = QtWidgets.QVBoxLayout(self)
@@ -789,6 +815,7 @@ class Launcher(QtWidgets.QDialog):
         for w in (self.resume, self.jd, self.projects, self.references):
             self.stack.addWidget(w)
         self.stack.addWidget(self._build_preferences_page())
+        self.stack.addWidget(self._build_audio_page())
         self.stack.addWidget(self._build_network_page())
         self.stack.addWidget(self._build_history_page())
         body.addWidget(self.stack, 1)
@@ -934,6 +961,111 @@ class Launcher(QtWidgets.QDialog):
 
     def _save_preferences(self):
         database.set_setting("preferences", self.prefs_edit.toPlainText().strip())
+
+    # ---- audio page ----
+
+    def _build_audio_page(self):
+        from services.audio_utils import INPUT_SETTING, OUTPUT_SETTING
+
+        page, layout = _page(
+            "Audio",
+            "Pick which microphone is captured as your voice, and which speaker "
+            "the interviewer's audio plays on. The interviewer is transcribed from "
+            "the output device's loopback, and the AI's spoken answer is played "
+            "there too — so choose the headset/speaker you actually listen on. "
+            "When a viewer sends their mic, IronStack injects it via VB-CABLE "
+            "(donationware from vb-cable.com; installed automatically on first "
+            "use if missing — reboot once after install). In Zoom/Teams, set the "
+            "microphone to 'CABLE Output (VB-Audio Virtual Cable)'.",
+        )
+
+        try:
+            speakers = sc.all_speakers()
+        except Exception:
+            get_logger().exception("audio: could not list speakers")
+            speakers = []
+        try:
+            mics = sc.all_microphones(include_loopback=False)
+        except Exception:
+            get_logger().exception("audio: could not list microphones")
+            mics = []
+
+        LBLW = 150
+
+        def _combo_row(label_text):
+            row = QtWidgets.QHBoxLayout()
+            lbl = QtWidgets.QLabel(label_text)
+            lbl.setObjectName("fieldLabel")
+            lbl.setFixedWidth(LBLW)
+            combo = QtWidgets.QComboBox()
+            combo.addItem("System default", "")
+            row.addWidget(lbl)
+            row.addWidget(combo, 1)
+            return row, combo
+
+        in_row, self.input_combo = _combo_row("INPUT · MICROPHONE")
+        for m in mics:
+            self.input_combo.addItem(m.name, m.name)
+        self._select_combo(self.input_combo, database.get_setting(INPUT_SETTING, ""))
+        layout.addLayout(in_row)
+        layout.addSpacing(6)
+
+        out_row, self.output_combo = _combo_row("OUTPUT · SPEAKER")
+        for s in speakers:
+            self.output_combo.addItem(s.name, s.name)
+        self._select_combo(self.output_combo, database.get_setting(OUTPUT_SETTING, ""))
+        layout.addLayout(out_row)
+
+        layout.addSpacing(14)
+        row = QtWidgets.QHBoxLayout()
+        save = QtWidgets.QPushButton("Save audio devices")
+        save.clicked.connect(self._save_audio_devices)
+        test = QtWidgets.QPushButton("Test output")
+        test.setObjectName("ghost")
+        test.setToolTip("Play a short tone on the selected output device")
+        test.clicked.connect(self._test_output)
+        row.addWidget(save)
+        row.addWidget(test)
+        row.addStretch(1)
+        layout.addLayout(row)
+        layout.addStretch(1)
+        return page
+
+    def _select_combo(self, combo, value):
+        idx = combo.findData(value)
+        combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+    def _save_audio_devices(self):
+        from services.audio_utils import INPUT_SETTING, OUTPUT_SETTING
+        database.set_setting(INPUT_SETTING, self.input_combo.currentData() or "")
+        database.set_setting(OUTPUT_SETTING, self.output_combo.currentData() or "")
+        get_logger().info("audio devices saved (input=%r, output=%r)",
+                          self.input_combo.currentText(), self.output_combo.currentText())
+        self._warn("Audio devices saved. They take effect when the interview starts.")
+
+    def _test_output(self):
+        """Play a short tone on the currently selected output device so the user
+        can confirm it's the one they're listening on (before committing)."""
+        name = self.output_combo.currentData() or ""
+
+        def run():
+            try:
+                from services.speaker import _com_init
+                _com_init()
+                import soundcard as _sc
+                import numpy as _np
+                from services.audio_utils import _match
+                speaker = _match(_sc.all_speakers(), name) or _sc.default_speaker()
+                sr = 24000
+                t = _np.arange(int(sr * 0.5)) / sr
+                tone = (0.2 * _np.sin(2 * _np.pi * 660 * t)).astype(_np.float32)
+                with speaker.player(samplerate=sr, channels=1, blocksize=2048) as p:
+                    p.play(tone.reshape(-1, 1))
+            except Exception:
+                get_logger().exception("audio: output test failed")
+
+        import threading
+        threading.Thread(target=run, daemon=True).start()
 
     # ---- network page ----
 

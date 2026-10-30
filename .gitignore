@@ -6,6 +6,9 @@ __pycache__/
 data/
 data-*/
 
+# VB-CABLE: keep the official zip + NOTICE; ignore extracted install tree
+vendor/vbcable/extracted/
+
 # PyInstaller build output
 build/
 dist/

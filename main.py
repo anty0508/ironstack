@@ -29,12 +29,15 @@ from config import MIN_TEXT_LENGTH
 from logsetup import setup_logging, get_logger
 from singleinstance import SingleInstance
 from storage import database
-from ui.overlay import Overlay, get_window_visibility_controller, get_ai_answer_controller
+from ui.overlay import (Overlay, get_window_visibility_controller,
+                        get_ai_answer_controller)
 from ui.launcher import Launcher, MessageDialog
 from services.transcriber import Transcriber
 from services.answerer import Answerer
 from services.netlink import Broadcaster, NetController, NetClient, apply_message
 from services.clipsync import ClipboardServer, ClipboardClient, get_clipboard_sync_controller
+from services.vbcable import ensure_installed
+from services.audiostream import set_candidate_audio_sink
 from ui.tray import AppTray, make_app_icon
 
 
@@ -237,6 +240,7 @@ class HostSession:
         self.remote_injector = None    # InputInjector for the shared monitor
         self._audio = None             # AudioServer (TCP) — live meeting audio
         self._clip = None              # ClipboardServer (TCP) — clipboard sync
+        self._mic = None               # MicServer (TCP) — viewer's mic, injected into host input
 
     # --- lifecycle ---
     def start(self):
@@ -250,6 +254,7 @@ class HostSession:
         self._start_remote()
         self._start_audio()
         self._start_clip()
+        self._start_mic()
         # If relay reachability is enabled, park outbound connections at the relay
         # so viewers can reach this host by its ID over the internet (CGNAT-proof).
         self.net.start_relay()
@@ -300,6 +305,19 @@ class HostSession:
         except Exception:
             get_logger().exception("clipboard: server failed to start")
 
+    def _start_mic(self):
+        if self._mic is not None:
+            return
+        try:
+            import secrets
+            from services.audiostream import MicServer
+            srv = MicServer(self.net.mic_port, secrets.token_hex(8))
+            srv.start()
+            self._mic = srv
+            self.net.map_extra_port(self.net.mic_port, protocol="TCP")
+        except Exception:
+            get_logger().exception("mic: server failed to start")
+
     def stop(self):
         if self._remote is not None:
             self._remote.stop()
@@ -307,6 +325,8 @@ class HostSession:
             self._audio.stop()
         if self._clip is not None:
             self._clip.stop()
+        if self._mic is not None:
+            self._mic.stop()
         self.net.stop_hosting()
 
     # --- interview registration ---
@@ -375,6 +395,23 @@ class HostSession:
         get_logger().info("clipboard: offered sync to viewer (clip port %d)",
                           self.net.clip_port)
 
+    def _offer_mic(self):
+        # A viewer opted in to send mic audio -> rotate the mic token and offer the
+        # mic port; the viewer connects, captures its mic, and we inject it into
+        # the host audio input (VB-CABLE) here. Kick off cable ensure early so the
+        # (one-time) installer/UAC can finish before packets arrive.
+        self._start_mic()
+        if self._mic is None:
+            return
+        import secrets
+        threading.Thread(target=ensure_installed, daemon=True).start()
+        token = secrets.token_hex(8)
+        self._mic.token = token
+        self.net.send({"type": "mic_offer", "mic_port": self.net.mic_port,
+                       "token": token})
+        get_logger().info("mic: offered intake to viewer (mic port %d)",
+                          self.net.mic_port)
+
     def _dispatch(self, msg):
         """Host-side handler for messages a viewer sends back (runs for the whole
         app run, not just during an interview)."""
@@ -402,6 +439,8 @@ class HostSession:
                 self._offer_audio()
             elif action == "clip_start":
                 self._offer_clip()
+            elif action == "mic_start":
+                self._offer_mic()
             return
         if t == "input":
             # Remote-control input over the reliable TCP control channel -> inject
@@ -507,6 +546,10 @@ def _run_interview(app, tray, system_prompt, meeting_id, start_geometry=None,
                                   console=_MicConsole(console, echo_guard),
                                   language=language_code, source="microphone")
 
+    # Mic ON Deepgram: client mic PCM (same as CABLE inject) → "You" stream.
+    # Mic OFF Deepgram: mic_transcriber captures host mic locally instead.
+    set_candidate_audio_sink(mic_transcriber.push_pcm)
+
     # Refresh button (local or triggered remotely by a viewer): restart both
     # Deepgram streams when transcription silently stops picking up speech.
     def restart_transcription():
@@ -591,6 +634,7 @@ def _run_interview(app, tray, system_prompt, meeting_id, start_geometry=None,
     # Teardown: stop the workers (releasing the audio devices) and the overlay's
     # hotkeys, then close the window before we loop back to the setup screen.
     stop.set()
+    set_candidate_audio_sink(None)
     transcriber.stop()
     mic_transcriber.stop()
     if host_session is not None:
@@ -756,6 +800,7 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
     # the host for the ones currently enabled.
     audio = {"client": None, "enabled": True}
     clip = {"client": None, "enabled": False}
+    mic = {"client": None, "enabled": False}
 
     # Audio on/off: actually tears down and re-dials the socket (not just local
     # muting), so turning it off actually stops the stream instead of just
@@ -777,6 +822,16 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
             clip["client"].stop()
             clip["client"] = None
 
+    # Mic on/off: off by default -- this PC's microphone is only sent to the host
+    # once the user opts in here (privacy: never streamed silently).
+    def on_mic_toggled(on):
+        mic["enabled"] = on
+        if on:
+            client.send({"type": "cmd", "action": "mic_start"})
+        elif mic["client"] is not None:
+            mic["client"].stop()
+            mic["client"] = None
+
     # The primary window: the host's screen. Opens now, before anything connects.
     remote = RemoteView(
         host,
@@ -784,7 +839,8 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
         connect_screen=screen_connect,
         on_open_transcript=show_transcript,
         on_toggle_mute=on_mute_toggled,
-        on_toggle_clip=on_clip_toggled)
+        on_toggle_clip=on_clip_toggled,
+        on_toggle_mic=on_mic_toggled)
     remote.set_connection_status("Connecting to relay server…")
     remote.show()
     if tray is not None:
@@ -805,6 +861,22 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
             audio["client"] = ac
         except Exception:
             get_logger().exception("audio: could not start playback (deps missing?)")
+
+    def open_mic(msg):
+        if not mic["enabled"]:
+            return   # turned off again while the offer was in flight
+        try:
+            from services.audiostream import MicClient
+            if mic["client"] is not None:
+                mic["client"].stop()
+            mc = MicClient(
+                room, 0, msg.get("token"),
+                connect=lambda: relaylink.dial_via_relay(rhost, rport, room, "mic"),
+                on_status=lambda s: get_logger().info("viewer mic: %s", s))
+            mc.start()
+            mic["client"] = mc
+        except Exception:
+            get_logger().exception("mic: could not start capture (deps missing?)")
 
     def open_clip(msg):
         if not clip["enabled"]:
@@ -858,6 +930,9 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
         if msg.get("type") == "clip_offer":
             open_clip(msg)                  # join clipboard sync
             return
+        if msg.get("type") == "mic_offer":
+            open_mic(msg)                   # start sending our mic to the host
+            return
         _handle_message(overlay, msg)
 
     def on_status(text):
@@ -872,6 +947,8 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
                 client.send({"type": "cmd", "action": "audio_start"})   # hear the meeting
             if clip["enabled"]:
                 client.send({"type": "cmd", "action": "clip_start"})    # sync clipboards
+            if mic["enabled"]:
+                client.send({"type": "cmd", "action": "mic_start"})     # send our mic
         elif low.startswith("waiting"):
             remote.set_connection_status("Connecting to host…")
         elif low.startswith("denied"):
@@ -938,6 +1015,8 @@ def _run_viewer(app, tray, net, target, start_geometry=None):
         audio["client"].stop()
     if clip["client"] is not None:
         clip["client"].stop()
+    if mic["client"] is not None:
+        mic["client"].stop()
     client.stop()
     recorder.finalize()   # flush any half-streamed answer (client thread is stopped)
     overlay.shutdown()

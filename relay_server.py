@@ -19,8 +19,8 @@ Reverse-tunnel model:
     The Host immediately opens a replacement, so the pool stays full.
 
 Handshake — the first line each side sends is newline-framed JSON, then raw bytes:
-  Viewer -> relay:  {"v":1,"role":"viewer","room":"<id>","channel":"control|screen"}
-  Host   -> relay:  {"v":1,"role":"host","room":"<id>","channel":"control|screen"}
+  Viewer -> relay:  {"v":1,"role":"viewer","room":"<id>","channel":"control|screen|audio|clip|mic"}
+  Host   -> relay:  {"v":1,"role":"host","room":"<id>","channel":"control|screen|audio|clip|mic"}
   relay  -> viewer: {"ok":1}            a host was matched; the splice begins
                     {"error":"..."}     no host available; the connection is closed
   relay  -> host:   {"ping":1} ...      idle heartbeats while parked
@@ -260,7 +260,7 @@ def _handle(sock):
         role = msg.get("role")
         room = str(msg.get("room", "")).strip()
         channel = str(msg.get("channel", "control"))
-        if not room or channel not in ("control", "screen", "audio", "clip"):
+        if not room or channel not in ("control", "screen", "audio", "clip", "mic"):
             _send_line(sock, {"error": "bad handshake"})
             sock.close()
             return

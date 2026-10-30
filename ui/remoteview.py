@@ -185,7 +185,7 @@ class RemoteView(QtWidgets.QWidget):
     closed = QtCore.Signal()
 
     def __init__(self, host, send_input, connect_screen=None, on_open_transcript=None,
-                 on_toggle_mute=None, on_toggle_clip=None):
+                 on_toggle_mute=None, on_toggle_clip=None, on_toggle_mic=None):
         super().__init__()
         self.setWindowTitle("IronStack — Remote")
         # Use the IronStack icon (this is a separate top-level window, so give it
@@ -212,6 +212,7 @@ class RemoteView(QtWidgets.QWidget):
         self._on_open_transcript = on_open_transcript
         self._on_toggle_mute = on_toggle_mute
         self._on_toggle_clip = on_toggle_clip
+        self._on_toggle_mic = on_toggle_mic
         self._client = None
         self._quality = "high"
         self._view_only = False
@@ -332,6 +333,13 @@ class RemoteView(QtWidgets.QWidget):
         if self._on_toggle_mute is not None:
             self._on_toggle_mute(muted)
 
+    def _toggle_mic(self, on):
+        self._mic_btn.setToolTip(
+            "Stop sending your microphone to the host" if on
+            else "Send your microphone into the host meeting mic (VB-CABLE)")
+        if self._on_toggle_mic is not None:
+            self._on_toggle_mic(on)
+
     def _toggle_clip(self, on):
         self._clip_btn.setToolTip(
             "Stop syncing clipboard with the host" if on
@@ -379,6 +387,21 @@ class RemoteView(QtWidgets.QWidget):
         self._mute_btn.setToolTip("Mute the host's audio")
         self._mute_btn.toggled.connect(self._toggle_mute)
         h.addWidget(self._mute_btn)
+
+        # Off by default: your mic is only sent to the host once you opt in here.
+        # Segoe Fluent Icons' "Microphone" glyph (E720) instead of the 🎤 emoji --
+        # a crisp outline that matches the rest of the toolbar instead of relying
+        # on whatever color/mono emoji font Windows happens to fall back to.
+        self._mic_btn = QtWidgets.QPushButton("")
+        mic_font = QtGui.QFont()
+        mic_font.setFamilies(["Segoe Fluent Icons", "Segoe MDL2 Assets"])
+        self._mic_btn.setFont(mic_font)
+        self._mic_btn.setCheckable(True)
+        self._mic_btn.setCursor(Qt.PointingHandCursor)
+        self._mic_btn.setToolTip(
+            "Send your microphone into the host meeting mic (VB-CABLE)")
+        self._mic_btn.toggled.connect(self._toggle_mic)
+        h.addWidget(self._mic_btn)
 
         # Off by default: clipboard sync only starts once the user opts in here.
         self._clip_btn = QtWidgets.QPushButton("📋")
