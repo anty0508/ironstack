@@ -60,6 +60,10 @@ DB_PATH = DATA_DIR / "interview.db"
 # --- OpenAI (answer generation: text -> short answer) ---
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ANSWER_MODEL = "gpt-5-nano"
+# Vision model that reads F8 screenshots (code / test problems) into text.
+SCREENSHOT_MODEL = "gpt-5-mini"
+# Answers about a screen (the image is attached): needs real visual reasoning.
+SCREEN_ANSWER_MODEL = "gpt-5-mini"
 
 # --- Deepgram (speech-to-text: system audio -> text, real-time) ---
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")

@@ -19,7 +19,7 @@ import ctypes
 import sys
 from ctypes import wintypes
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 from pypinyin import pinyin, Style
 
 from config import LANGUAGES, DEFAULT_LANGUAGE_CODE
@@ -30,6 +30,7 @@ Qt = QtCore.Qt
 # Win32 hotkey modifiers / messages
 MOD_ALT = 0x0001
 MOD_CONTROL = 0x0002
+MOD_SHIFT = 0x0004
 MOD_NOREPEAT = 0x4000
 WM_HOTKEY = 0x0312
 WM_QUIT = 0x0012
@@ -47,11 +48,15 @@ WS_EX_TRANSPARENT = 0x00000020
 VK_H = 0x48   # show/hide
 VK_C = 0x43   # click-through
 VK_S = 0x53   # stealth
+VK_F8 = 0x77  # screenshot -> read -> answer
 
 # Hotkey ids
 HK_TOGGLE = 1
 HK_CLICKTHROUGH = 4
 HK_TOGGLE_CAPTURE = 5
+HK_SCREENSHOT = 6          # F8: capture + answer
+HK_SCREENSHOT_SCROLL = 7   # Shift+F8: auto-scroll capture + answer
+HK_SCREENSHOT_PART = 8     # Ctrl+F8: add one part, answer later with F8
 
 
 # A user32 handle that preserves the Win32 last-error, so failures can be
@@ -615,6 +620,29 @@ QScrollArea { border: none; background: transparent; }
     border: 1px solid rgba(143, 208, 127, 0.22);
     border-radius: 10px;
 }
+#sbubble {
+    background: rgba(40, 52, 78, 0.92);
+    border: 1px solid rgba(110, 160, 255, 0.28);
+    border-radius: 10px;
+}
+#ibubble {
+    background: rgba(70, 48, 76, 0.92);
+    border: 1px solid rgba(200, 140, 220, 0.28);
+    border-radius: 10px;
+}
+#stag { font-size: 10px; font-weight: 700; color: #7fa8ff; letter-spacing: 1px; }
+#itag { font-size: 10px; font-weight: 700; color: #d79be8; letter-spacing: 1px; }
+#instrEdit {
+    background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 8px; padding: 6px 10px; color: #e8eaf0; font-size: 13px;
+}
+#instrEdit:focus { border: 1px solid rgba(215,155,232,0.6); }
+#instrSend {
+    background: rgba(215,155,232,0.16); border: 1px solid rgba(215,155,232,0.45);
+    border-radius: 8px; color: #ebc4f5; font-size: 12px; font-weight: 700;
+    padding: 6px 14px;
+}
+#instrSend:hover { background: rgba(215,155,232,0.30); color: #ffffff; }
 #qtag { font-size: 10px; font-weight: 700; color: #7f8aa3; letter-spacing: 1px; }
 #aitag { font-size: 10px; font-weight: 700; color: #f2a33c; letter-spacing: 1px; }
 #utag { font-size: 10px; font-weight: 700; color: #8fd07f; letter-spacing: 1px; }
@@ -653,6 +681,10 @@ class Overlay(QtWidgets.QWidget):
     _sig_delta = QtCore.Signal(str)
     _sig_end = QtCore.Signal(str)
     _sig_close = QtCore.Signal()
+    _sig_screen = QtCore.Signal(object, str)   # captured screenshots (JPEG list), status note
+    _sig_screen_text = QtCore.Signal(str)    # text read from the latest screenshot
+    _sig_instruction = QtCore.Signal(str)    # typed instruction note
+    _sig_capture_hidden = QtCore.Signal(bool)   # hide / restore around a screen capture
     _sig_set_shared = QtCore.Signal(str)   # remote update -> set shared notepad text
     _sig_connected = QtCore.Signal(bool)   # a network connection was established
     _sig_set_language = QtCore.Signal(str, str)   # peer changed language -> reflect it
@@ -664,6 +696,8 @@ class Overlay(QtWidgets.QWidget):
     stealth_toggled = QtCore.Signal(bool)        # user toggled stealth -> sync to peer
     ai_toggled = QtCore.Signal(bool)             # user toggled AI answers -> sync to peer
     refresh_requested = QtCore.Signal()          # user asked to restart transcription
+    screenshot_requested = QtCore.Signal(str)    # F8 hotkeys: "answer" | "scroll" | "part"
+    instruction_submitted = QtCore.Signal(str)   # text typed in the bottom input box
 
     def __init__(self, start_geometry=None, language_code=DEFAULT_LANGUAGE_CODE,
                  role="solo"):
@@ -687,6 +721,10 @@ class Overlay(QtWidgets.QWidget):
         self.resize(580, 640)
 
         self._current_body = None
+        self._hidden_for_capture = False   # we hid the window for a screen capture
+        self._screen_body = None       # text label of the open screenshot bubble
+        self._screen_grid = None       # thumbnail grid of the open screenshot bubble
+        self._screen_images = []       # QImages shown in that grid
         self._user_body = None         # the live, streaming "You" bubble (or None)
         self._answer_text = ""
         self._click_through = False
@@ -726,6 +764,10 @@ class Overlay(QtWidgets.QWidget):
         self._sig_delta.connect(self._on_delta)
         self._sig_end.connect(self._on_end)
         self._sig_close.connect(self.close)
+        self._sig_screen.connect(self._on_screen)
+        self._sig_screen_text.connect(self._on_screen_text)
+        self._sig_instruction.connect(self._on_instruction)
+        self._sig_capture_hidden.connect(self._on_capture_hidden)
 
         self._init_hotkeys()
         QtCore.QTimer.singleShot(0, lambda: self._apply_capture_exclusion())
@@ -919,11 +961,33 @@ class Overlay(QtWidgets.QWidget):
         self.body_split.splitterMoved.connect(lambda *_: self._refresh_bubble_widths())
         body.addWidget(self.body_split, 1)
 
+        # --- instruction input: typed text goes to the AI and triggers an answer ---
+        input_row = QtWidgets.QHBoxLayout()
+        input_row.setSpacing(8)
+        self.instr_edit = QtWidgets.QLineEdit()
+        self.instr_edit.setObjectName("instrEdit")
+        self.instr_edit.setPlaceholderText(
+            "Tell the AI what to do, e.g. \"that is wrong, give the correct answer\"")
+        self.instr_edit.returnPressed.connect(self._submit_instruction)
+        input_row.addWidget(self.instr_edit, 1)
+        send_btn = QtWidgets.QPushButton("Send")
+        send_btn.setObjectName("instrSend")
+        send_btn.setCursor(Qt.PointingHandCursor)
+        send_btn.setFocusPolicy(Qt.NoFocus)
+        send_btn.clicked.connect(self._submit_instruction)
+        input_row.addWidget(send_btn)
+        body.addLayout(input_row)
+        if self._role == "viewer":
+            # A viewer only mirrors the meeting; answering happens on the host.
+            self.instr_edit.hide()
+            send_btn.hide()
+
         # --- status / hint ---
         self.status = QtWidgets.QLabel(
-            "Ctrl+Alt+H hide · Ctrl+Alt+C click-through"
+            "Ctrl+Alt+H hide · Ctrl+Alt+C click-through · F8 screen · Shift+F8 scroll · Ctrl+F8 add part"
         )
         self.status.setObjectName("status")
+        self.status.setWordWrap(True)   # the hint list is long; wrap, don't widen the window
         body.addWidget(self.status)
 
         # Opacity control lives at the bottom-right now (out of the dense header).
@@ -1051,6 +1115,8 @@ class Overlay(QtWidgets.QWidget):
     def _add_bubble(self, role):
         is_ai = role == "AI"
         is_user = role == "You"
+        is_screen = role == "Screen"
+        is_instr = role == "Instruction"
 
         # each message sits in a row; a stretch pushes it left (AI) or right
         # (interviewer / the candidate's own speech), like a normal chat app.
@@ -1061,7 +1127,9 @@ class Overlay(QtWidgets.QWidget):
         rl.setSpacing(0)
 
         frame = QtWidgets.QFrame()
-        frame.setObjectName("abubble" if is_ai else "ububble" if is_user else "qbubble")
+        frame.setObjectName("abubble" if is_ai else "ububble" if is_user
+                            else "sbubble" if is_screen else "ibubble" if is_instr
+                            else "qbubble")
         frame.setFixedWidth(self._bubble_width())
         self._bubbles.append(frame)
 
@@ -1070,7 +1138,8 @@ class Overlay(QtWidgets.QWidget):
         v.setSpacing(4)
 
         tag = QtWidgets.QLabel(("● " + role) if is_ai else role.upper())
-        tag.setObjectName("aitag" if is_ai else "utag" if is_user else "qtag")
+        tag.setObjectName("aitag" if is_ai else "utag" if is_user
+                          else "stag" if is_screen else "itag" if is_instr else "qtag")
         v.addWidget(tag)
 
         body = QtWidgets.QLabel("")
@@ -1289,6 +1358,85 @@ class Overlay(QtWidgets.QWidget):
         self._current_body = None
         self._caption_live = False     # resume listening animation
 
+    @QtCore.Slot(object, str)
+    def _on_screen(self, jpegs, note):
+        # One screenshot bubble stays open (thumbnails on top, the text read from
+        # them underneath) until _on_screen_text fills it in; more frames added
+        # meanwhile (scroll capture, extra parts) join the same bubble.
+        if self._screen_grid is None:
+            body, layout = self._add_bubble("Screen")
+            host = QtWidgets.QWidget()
+            self._screen_grid = QtWidgets.QGridLayout(host)
+            self._screen_grid.setContentsMargins(0, 0, 0, 0)
+            self._screen_grid.setSpacing(6)
+            layout.insertWidget(1, host)
+            body.setTextFormat(Qt.PlainText)
+            self._screen_body = body
+            self._screen_images = []
+        for jpeg in jpegs:
+            image = QtGui.QImage.fromData(jpeg)
+            if not image.isNull():
+                self._screen_images.append(image)
+        self._screen_body.setText(note)
+        self._layout_screen_thumbs()
+        self._current_body = None
+        self._scroll_to_top()
+
+    @QtCore.Slot(bool)
+    def _on_capture_hidden(self, hide):
+        # Keep the overlay out of a screen capture (and hand keyboard focus back to
+        # the page underneath). It comes back only if it was visible before, and
+        # without taking focus so the page keeps it. show() re-applies stealth.
+        if hide:
+            self._hidden_for_capture = self.isVisible()
+            if self._hidden_for_capture:
+                self.hide()
+        elif self._hidden_for_capture:
+            self._hidden_for_capture = False
+            self.setAttribute(Qt.WA_ShowWithoutActivating, True)
+            self.show()
+            self.setAttribute(Qt.WA_ShowWithoutActivating, False)
+
+    def _layout_screen_thumbs(self):
+        # A lone frame uses the full bubble width; several sit in two columns.
+        grid = self._screen_grid
+        while grid.count():
+            item = grid.takeAt(0)
+            if item.widget() is not None:
+                item.widget().deleteLater()
+        count = len(self._screen_images)
+        avail = max(120, self._bubble_width() - 28)
+        cols = 1 if count <= 1 else 2
+        width = avail if cols == 1 else (avail - 6) // 2
+        for i, image in enumerate(self._screen_images):
+            thumb = QtWidgets.QLabel()
+            thumb.setPixmap(QtGui.QPixmap.fromImage(
+                image.scaledToWidth(width, Qt.SmoothTransformation)))
+            grid.addWidget(thumb, i // cols, i % cols)
+
+    @QtCore.Slot(str)
+    def _on_screen_text(self, text):
+        if self._screen_body is not None:
+            self._screen_body.setText(text)
+        self._screen_body = None
+        self._screen_grid = None
+        self._screen_images = []
+        self._scroll_to_top()
+
+    @QtCore.Slot(str)
+    def _on_instruction(self, text):
+        body, _ = self._add_bubble("Instruction")
+        body.setTextFormat(Qt.PlainText)
+        body.setText(text)
+        self._current_body = None
+
+    def _submit_instruction(self):
+        text = self.instr_edit.text().strip()
+        if not text:
+            return
+        self.instr_edit.clear()
+        self.instruction_submitted.emit(text)
+
     @QtCore.Slot(str)
     def _on_user_partial(self, text):
         # Live, token-by-token streaming of the candidate's own speech into a
@@ -1405,9 +1553,12 @@ class Overlay(QtWidgets.QWidget):
     def _init_hotkeys(self):
         # Ctrl+Alt+H (show/hide) is owned by the shared visibility controller so
         # it works for the setup window too; the rest are overlay-only.
-        self.hotkeys = GlobalHotkeys([
-            (HK_CLICKTHROUGH, MOD_CONTROL | MOD_ALT, VK_C),
-        ])
+        bindings = [(HK_CLICKTHROUGH, MOD_CONTROL | MOD_ALT, VK_C)]
+        if self._role != "viewer":   # only the host can answer
+            bindings += [(HK_SCREENSHOT, 0, VK_F8),
+                         (HK_SCREENSHOT_SCROLL, MOD_SHIFT, VK_F8),
+                         (HK_SCREENSHOT_PART, MOD_CONTROL, VK_F8)]
+        self.hotkeys = GlobalHotkeys(bindings)
         self.hotkeys.triggered.connect(self._on_hotkey)
         self.hotkeys.start()
 
@@ -1415,6 +1566,12 @@ class Overlay(QtWidgets.QWidget):
     def _on_hotkey(self, hid):
         if hid == HK_CLICKTHROUGH:
             self._toggle_click_through()
+        elif hid == HK_SCREENSHOT:
+            self.screenshot_requested.emit("answer")
+        elif hid == HK_SCREENSHOT_SCROLL:
+            self.screenshot_requested.emit("scroll")
+        elif hid == HK_SCREENSHOT_PART:
+            self.screenshot_requested.emit("part")
 
     def _on_language_changed(self, _idx):
         code = self.language_combo.currentData()
@@ -1447,7 +1604,8 @@ class Overlay(QtWidgets.QWidget):
         )
 
     def _refresh_status(self, applied):
-        base = "Ctrl+Alt+H hide · Ctrl+Alt+C click-through · Ctrl+Alt+S stealth"
+        base = ("Ctrl+Alt+H hide · Ctrl+Alt+C click-through · Ctrl+Alt+S stealth · "
+                "F8 screen · Shift+F8 scroll · Ctrl+F8 add part")
         if self._click_through:
             base = "CLICK-THROUGH ON · Ctrl+Alt+C to disable"
         if applied:
@@ -1589,6 +1747,20 @@ class Overlay(QtWidgets.QWidget):
 
     def show_user_answer(self, text):
         self._sig_user.emit(text)
+
+    def set_capture_hidden(self, hide):
+        """Hide (True) or restore (False) the window around a screen capture.
+        Thread-safe; the caller waits for the screen to repaint after hiding."""
+        self._sig_capture_hidden.emit(bool(hide))
+
+    def show_screen(self, jpegs, note="Reading the screen…"):
+        self._sig_screen.emit(list(jpegs), note)
+
+    def screen_text(self, text):
+        self._sig_screen_text.emit(text or "")
+
+    def show_instruction(self, text):
+        self._sig_instruction.emit(text)
 
     def user_partial(self, text):
         self._sig_user_partial.emit(text or "")

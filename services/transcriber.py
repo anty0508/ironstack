@@ -26,6 +26,13 @@ from services.vbcable import find_cable_output_microphone
 from logsetup import get_logger
 
 
+# How long to wait before looking for a capture device again when none is found.
+# A missing microphone is a normal state (e.g. a Remote Desktop session with no
+# audio recording), so it is polled slowly and reported once.
+MIC_RETRY_SECONDS = 5.0
+LOOPBACK_RETRY_SECONDS = 0.5
+
+
 class Transcriber:
     """Capture an audio source and stream it to Deepgram's real-time
     speech-to-text API.
@@ -123,18 +130,28 @@ class Transcriber:
         if sys.platform == "win32":
             ctypes.windll.ole32.CoInitializeEx(None, 0)  # 0 = COINIT_MULTITHREADED
 
+        retry = MIC_RETRY_SECONDS if self.source == "microphone" else LOOPBACK_RETRY_SECONDS
+        unavailable_logged = False   # log a missing device once per outage
         try:
             while not self.stop_event.is_set():
                 epoch = capture_epoch()
                 mic_on = viewer_mic_active()
                 try:
                     device, channels, label = self._resolve_device()
-                except Exception:
-                    get_logger().exception(
-                        "audio: resolve device failed (source=%s)", self.source)
-                    if self.stop_event.wait(0.5):
+                except Exception as exc:
+                    if not unavailable_logged:
+                        unavailable_logged = True
+                        if self.source == "microphone":
+                            get_logger().warning(
+                                "audio: no usable microphone (%s); checking again "
+                                "every %.0fs", exc, retry)
+                        else:
+                            get_logger().exception(
+                                "audio: resolve device failed (source=%s)", self.source)
+                    if self.stop_event.wait(retry):
                         break
                     continue
+                unavailable_logged = False
 
                 if device is None:
                     # Mic ON but CABLE Output not visible yet — wait and retry.

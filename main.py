@@ -34,6 +34,7 @@ from ui.overlay import (Overlay, get_window_visibility_controller,
 from ui.launcher import Launcher, MessageDialog
 from services.transcriber import Transcriber
 from services.answerer import Answerer
+from services.screenshot import grab_screen_jpeg, capture_scroll_frames, read_screens
 from services.netlink import Broadcaster, NetController, NetClient, apply_message
 from services.clipsync import ClipboardServer, ClipboardClient, get_clipboard_sync_controller
 from services.vbcable import ensure_installed
@@ -502,16 +503,93 @@ def _run_interview(app, tray, system_prompt, meeting_id, start_geometry=None,
     def answer_worker():
         while not stop.is_set():
             try:
-                question = answer_queue.get(timeout=0.25)
+                item = answer_queue.get(timeout=0.25)
             except queue.Empty:
                 continue
             try:
-                answerer.answer(question)
+                # A plain string is an interviewer question; ("screen" |
+                # "instruction", text) is something I asked for myself.
+                if isinstance(item, tuple):
+                    kind, text, *extra = item
+                    if kind == "screen":
+                        answerer.answer_screen(text, extra[0] if extra else None)
+                    else:
+                        answerer.answer_instruction(text)
+                else:
+                    answerer.answer(item)
             except Exception as exc:
                 get_logger().exception("answer failed")
                 overlay.info(f"[error] answer failed: {exc}")
 
     threading.Thread(target=answer_worker, daemon=True).start()
+
+    # F8 family. F8 captures the screen and answers; Shift+F8 scrolls the pane under
+    # the cursor and captures every frame; Ctrl+F8 only adds one part, to be
+    # answered later with F8. The frames are read by the vision model off the GUI
+    # thread, then queued so the answer worker adds the result to the context.
+    screen_state = {"parts": [], "t": 0.0}
+    screen_lock = threading.Lock()
+    PART_TTL_SECONDS = 300
+    HIDE_REPAINT_SECONDS = 0.3   # let the screen repaint without the overlay
+
+    def capture(grab):
+        """Run `grab` with the overlay hidden, and show it again right after."""
+        overlay.set_capture_hidden(True)
+        time.sleep(HIDE_REPAINT_SECONDS)
+        try:
+            return grab()
+        finally:
+            overlay.set_capture_hidden(False)
+
+    def read_screen(mode):
+        if not screen_lock.acquire(blocking=False):
+            overlay.info("[screen] still busy with the previous capture")
+            return
+        try:
+            parts = screen_state["parts"]
+            if parts and time.time() - screen_state["t"] > PART_TTL_SECONDS:
+                parts.clear()
+                console.screen_text("[earlier parts discarded: older than 5 minutes]")
+
+            if mode == "part":
+                jpeg = capture(grab_screen_jpeg)
+                parts.append(jpeg)
+                screen_state["t"] = time.time()
+                console.show_screen([jpeg], f"Part {len(parts)} added. Press F8 to read and answer.")
+                return
+
+            if mode == "scroll":
+                overlay.info("[screen] scrolling and capturing…")
+                new = capture(lambda: capture_scroll_frames(on_status=overlay.info))
+            else:
+                new = [capture(grab_screen_jpeg)]
+
+            frames = list(parts)          # parts added earlier were already shown
+            added = []
+            for jpeg in new:
+                if not frames or jpeg != frames[-1]:   # skip an unchanged screen
+                    frames.append(jpeg)
+                    added.append(jpeg)
+            parts.clear()
+            console.show_screen(added, f"Reading {len(frames)} screen(s)…")
+            result = read_screens(frames)
+            if not result.text:
+                console.screen_text("[nothing readable on the screen]")
+                return
+            console.screen_text(result.text)
+            answer_queue.put(("screen", result.text, result.images))
+        except Exception as exc:
+            screen_state["parts"].clear()
+            get_logger().exception("screenshot failed")
+            console.screen_text(f"[could not read the screen: {exc}]")
+        finally:
+            screen_lock.release()
+
+    overlay.screenshot_requested.connect(
+        lambda mode: threading.Thread(target=read_screen, args=(mode,),
+                                      daemon=True).start())
+    overlay.instruction_submitted.connect(
+        lambda text: answer_queue.put(("instruction", text)))
 
     # The interviewer's voice bleeds from the speakers into the mic, so the mic
     # stream would transcribe it too and show a duplicate "You" bubble. The guard
@@ -536,6 +614,7 @@ def _run_interview(app, tray, system_prompt, meeting_id, start_geometry=None,
             console.discard_user_answer()
             return
         console.show_user_answer(text)
+        answerer.add_candidate_speech(text)
         try:
             database.add_message(meeting_id, "candidate", text)
         except Exception:

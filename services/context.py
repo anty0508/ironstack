@@ -24,6 +24,24 @@ def build_system_prompt(resume="", job_description="", projects=None,
     projects_text = _render_docs(projects)
     references_text = _render_docs(references)
 
+    # Said only when the document is missing, so the model never invents it.
+    missing = []
+    if not resume.strip():
+        missing.append(
+            "I gave you NO resume. You do not know my name, employers, job titles, "
+            "dates, school or years of experience. Never invent them and never "
+            "output a placeholder. If a question needs one of those facts (my "
+            "name, my current role, where I worked), answer in general terms about "
+            "the kind of work and skills involved, or give a short natural reply "
+            "that states no made-up fact. Technical and skill questions are "
+            "answered normally, as someone who has done that work.")
+    if not job_description.strip():
+        missing.append(
+            "I gave you NO job description, so do not assume details about the "
+            "role or the company; answer from the question itself.")
+    missing_note = ("\nNOTHING-PROVIDED NOTES:\n- " + "\n- ".join(missing) + "\n"
+                    if missing else "")
+
     return f"""You are helping me answer questions during a live job interview.
 
 You ARE me, the candidate. Always answer in the first person, as if I am speaking.
@@ -159,6 +177,7 @@ a resume. Match that style and length.
   exact words I should say out loud. If you truly cannot answer, just give a
   short natural reply instead.
 
+{missing_note}
 MY PREFERENCES (salary, notice, availability, etc.):
 {preferences or "(preferences not provided)"}
 

@@ -1389,6 +1389,16 @@ class Launcher(QtWidgets.QDialog):
                     f"<p style='color:#8fd07f'><b>You:</b> "
                     f"{html.escape(msg['content'])}</p>"
                 )
+            elif msg["role"] == "screen":
+                parts.append(
+                    f"<p style='color:#7fa8ff'><b>Screen:</b></p>"
+                    f"<pre>{html.escape(msg['content'])}</pre>"
+                )
+            elif msg["role"] == "instruction":
+                parts.append(
+                    f"<p style='color:#d79be8'><b>Instruction:</b> "
+                    f"{html.escape(msg['content'])}</p>"
+                )
             else:
                 parts.append("<p style='color:#f2a33c'><b>AI</b></p>"
                              + Overlay._format_answer(msg["content"]))
@@ -1399,15 +1409,6 @@ class Launcher(QtWidgets.QDialog):
     def _start(self):
         resume_ids = self.resume.selected_ids()
         jd_ids = self.jd.selected_ids()
-        if not resume_ids:
-            self._warn("Pick a Resume (import one first if the list is empty).")
-            self.nav.setCurrentRow(0)
-            return
-        if not jd_ids:
-            self._warn("Pick a Job Description (import one first if the list is empty).")
-            self.nav.setCurrentRow(1)
-            return
-
         self._save_preferences()
 
         self.language_code = self.language_combo.currentData()

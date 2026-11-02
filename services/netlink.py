@@ -710,6 +710,16 @@ class Broadcaster:
         self.overlay.end_answer(note)
         self._emit("answer_end", note=note or "")
 
+    # --- screenshots and typed instructions: local overlay only (not mirrored) ---
+    def show_screen(self, jpegs, note="Reading the screen…"):
+        self.overlay.show_screen(jpegs, note)
+
+    def screen_text(self, text):
+        self.overlay.screen_text(text)
+
+    def show_instruction(self, text):
+        self.overlay.show_instruction(text)
+
     # --- candidate's own spoken answer (mic transcriber) ---
     # The candidate's own talking is shown only on the Viewers, never on the Host,
     # so these are net-only (no local overlay update).
