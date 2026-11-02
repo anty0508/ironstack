@@ -4,16 +4,16 @@ Routing (Host side) — two modes, nothing else:
 
   Mic OFF:
     host mic + host out  →  client out
-    host mic + host out  →  Deepgram  (separate Transcribers in main.py)
+    host mic + host out  →  Deepgram
 
   Mic ON (Viewer mic connected + CABLE inject live):
-    client mic  →  host mic   (VB-CABLE inject; meeting apps use CABLE Output)
-    host out    →  client out (loopback only — never host mic / client echo)
-    host out + client mic  →  Deepgram
-      (loopback Transcriber + mic Transcriber via push_candidate_audio)
+    client mic  →  host mic (CABLE)  →  Deepgram "You"  (no client voice)
+    host out    →  client out + Deepgram
+    (meeting apps must use CABLE Output as mic; speaker = real headphones)
 
-`viewer_mic_active` is the single switch for the return mix and for skipping
-local host-mic capture in the mic Transcriber.
+`viewer_mic_active` switches the return mix and which mic Deepgram captures
+(real host mic vs CABLE Output). `bump_capture_epoch` reopens loopback after
+Windows default playback is restored off CABLE Input.
 
 Framing: [1-byte type][4-byte big-endian length][payload]
   Viewer -> Host:   MT_AUTH   json {token}
@@ -141,11 +141,12 @@ class _SampleFIFO:
 # ======================================================================
 
 # Single switch: True only while Viewer mic is actually injecting into CABLE.
-# Drives return mix (below) and mic-Transcriber skip/push in transcriber.py.
+# Drives return mix and mic-Transcriber device (real mic vs CABLE Output).
 _viewer_mic_active = threading.Event()
-# Mic-ON Deepgram path: same PCM as CABLE inject → mic Transcriber ("You").
-_candidate_audio_sink = None
-_candidate_audio_lock = threading.Lock()
+# Bumped after restoring real Windows playback so loopback/Deepgram reopen on
+# the headphones instead of staying bound to a silent/wrong endpoint.
+_capture_epoch = 0
+_capture_epoch_lock = threading.Lock()
 
 
 def set_viewer_mic_active(active):
@@ -159,6 +160,20 @@ def viewer_mic_active():
     return _viewer_mic_active.is_set()
 
 
+def capture_epoch():
+    with _capture_epoch_lock:
+        return _capture_epoch
+
+
+def bump_capture_epoch(reason=""):
+    """Force AudioServer + Transcriber captures to reopen their devices."""
+    global _capture_epoch
+    with _capture_epoch_lock:
+        _capture_epoch += 1
+        n = _capture_epoch
+    get_logger().info("audio: capture epoch -> %s (%s)", n, reason or "refresh")
+
+
 def mix_for_viewer(loop_frame, mic_frame):
     """Return PCM for client out. Mic ON → host out only; Mic OFF → host out + host mic."""
     if viewer_mic_active():
@@ -166,27 +181,12 @@ def mix_for_viewer(loop_frame, mic_frame):
     return loop_frame + mic_frame
 
 
-def set_candidate_audio_sink(callback):
-    """Register `callback(float32_mono_samples, sample_rate)` or None to clear."""
-    global _candidate_audio_sink
-    with _candidate_audio_lock:
-        _candidate_audio_sink = callback
-
-
-def push_candidate_audio(samples, sample_rate):
-    """Mic ON: forward Viewer-mic PCM to Deepgram ("You"). No-op if unset."""
-    with _candidate_audio_lock:
-        sink = _candidate_audio_sink
-    if sink is None:
-        return
-    try:
-        sink(samples, sample_rate)
-    except Exception:
-        get_logger().debug("mic: candidate audio sink failed", exc_info=True)
-
-
 class _Capture:
-    """Records one device (loopback or mic) into a FIFO as mono @ AUDIO_SR."""
+    """Records one device (loopback or mic) into a FIFO as mono @ AUDIO_SR.
+
+    Reopens when `capture_epoch` bumps (e.g. after restoring default playback
+    off CABLE) so client-out host sound tracks the real speaker.
+    """
 
     def __init__(self, kind):
         self.kind = kind      # "loopback" | "mic"
@@ -201,23 +201,29 @@ class _Capture:
 
     def _run(self):
         _com_init()
-        try:
-            if self.kind == "mic":
-                device, channels = find_microphone(), 1
-            else:
-                device, channels = find_loopback(), 2
-            get_logger().info("audio: capturing %s %r", self.kind,
-                              getattr(device, "name", device))
-            with device.recorder(samplerate=CAPTURE_SR, channels=channels,
-                                  blocksize=CAP_BLOCK) as rec:
-                while not self._stop.is_set():
-                    data = rec.record(numframes=CAP_BLOCK)
-                    mono = np.mean(data, axis=1) if data.ndim > 1 else data
-                    self.fifo.write(resample(mono, CAPTURE_SR, AUDIO_SR))
-        except Exception:
-            # A missing mic (or loopback) just means that side is silent; the other
-            # still streams. Don't take the session down.
-            get_logger().exception("audio: %s capture failed", self.kind)
+        while not self._stop.is_set():
+            epoch = capture_epoch()
+            try:
+                if self.kind == "mic":
+                    # Always the real host mic for the return mix; discarded
+                    # while viewer_mic_active (mix_for_viewer sends loopback only).
+                    device, channels = find_microphone(), 1
+                else:
+                    device, channels = find_loopback(), 2
+                get_logger().info("audio: capturing %s %r (epoch %s)", self.kind,
+                                  getattr(device, "name", device), epoch)
+                with device.recorder(samplerate=CAPTURE_SR, channels=channels,
+                                      blocksize=CAP_BLOCK) as rec:
+                    while not self._stop.is_set() and capture_epoch() == epoch:
+                        data = rec.record(numframes=CAP_BLOCK)
+                        mono = np.mean(data, axis=1) if data.ndim > 1 else data
+                        self.fifo.write(resample(mono, CAPTURE_SR, AUDIO_SR))
+            except Exception:
+                # A missing mic (or loopback) just means that side is silent; the
+                # other still streams. Don't take the session down.
+                get_logger().exception("audio: %s capture failed", self.kind)
+                if self._stop.wait(0.5):
+                    break
 
 
 class _TokenServer:
@@ -525,6 +531,7 @@ def _mic_playback_loop(fifo, should_run):
         # meeting apps then play the interviewer into the cable and headset
         # loopback (what we send to the Viewer) goes silent.
         ensure_real_playback_default(chosen_output_name())
+        bump_capture_epoch("mic-on: restored real playback default")
         speaker = find_mic_inject_speaker()
         get_logger().info(
             "mic: injecting viewer mic into host input via %r "
@@ -535,7 +542,8 @@ def _mic_playback_loop(fifo, should_run):
             set_viewer_mic_active(True)
             armed = True
             get_logger().info(
-                "mic: inject live — client mic→host mic; host out→client out")
+                "mic: inject live — client mic→host mic→Deepgram; "
+                "host out→client out + Deepgram")
             while should_run():
                 frame = fifo.read(FRAME_SAMPLES).reshape(-1, 1)
                 player.play(frame)
@@ -544,6 +552,7 @@ def _mic_playback_loop(fifo, should_run):
     finally:
         if armed:
             set_viewer_mic_active(False)
+            bump_capture_epoch("mic-off: back to host mic + host out mix")
 
 
 class MicServer(_TokenServer):
@@ -587,9 +596,9 @@ class MicServer(_TokenServer):
                     continue
                 try:
                     for samples in decoder.decode(data):
+                        # Inject only — Deepgram "You" captures CABLE Output
+                        # (client mic → host mic → text), not this PCM fork.
                         fifo.write(samples)
-                        # Same PCM goes to CABLE (meeting mic) and to "You" text.
-                        push_candidate_audio(samples, AUDIO_SR)
                 except Exception:
                     get_logger().debug("mic: decode failed", exc_info=True)
         finally:

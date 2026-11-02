@@ -37,7 +37,6 @@ from services.answerer import Answerer
 from services.netlink import Broadcaster, NetController, NetClient, apply_message
 from services.clipsync import ClipboardServer, ClipboardClient, get_clipboard_sync_controller
 from services.vbcable import ensure_installed
-from services.audiostream import set_candidate_audio_sink
 from ui.tray import AppTray, make_app_icon
 
 
@@ -542,13 +541,11 @@ def _run_interview(app, tray, system_prompt, meeting_id, start_geometry=None,
         except Exception:
             get_logger().exception("failed to persist candidate line")
 
+    # Mic OFF: captures real host mic. Mic ON: switches to CABLE Output
+    # (client mic → host mic → Deepgram "You"); no fork via push_pcm.
     mic_transcriber = Transcriber(on_question=on_user_speech,
                                   console=_MicConsole(console, echo_guard),
                                   language=language_code, source="microphone")
-
-    # Mic ON Deepgram: client mic PCM (same as CABLE inject) → "You" stream.
-    # Mic OFF Deepgram: mic_transcriber captures host mic locally instead.
-    set_candidate_audio_sink(mic_transcriber.push_pcm)
 
     # Refresh button (local or triggered remotely by a viewer): restart both
     # Deepgram streams when transcription silently stops picking up speech.
@@ -634,7 +631,6 @@ def _run_interview(app, tray, system_prompt, meeting_id, start_geometry=None,
     # Teardown: stop the workers (releasing the audio devices) and the overlay's
     # hotkeys, then close the window before we loop back to the setup screen.
     stop.set()
-    set_candidate_audio_sink(None)
     transcriber.stop()
     mic_transcriber.stop()
     if host_session is not None:

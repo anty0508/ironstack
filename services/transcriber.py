@@ -21,7 +21,8 @@ from config import (
     UTTERANCE_END_MS,
 )
 from services.audio_utils import find_loopback, find_microphone, resample
-from services.audiostream import viewer_mic_active
+from services.audiostream import capture_epoch, viewer_mic_active
+from services.vbcable import find_cable_output_microphone
 from logsetup import get_logger
 
 
@@ -30,8 +31,10 @@ class Transcriber:
     speech-to-text API.
 
     `source` selects what is captured:
-      - "loopback"   : system audio (the interviewer's voice) -- the default.
-      - "microphone" : the real mic (the candidate's own voice).
+      - "loopback"   : host sound (interviewer) — always.
+      - "microphone" : Mic OFF → real host mic; Mic ON → CABLE Output
+                       (client mic after VB-CABLE inject). Reopens when
+                       `viewer_mic_active` or `capture_epoch` changes.
 
     Deepgram emits interim results word-by-word as soon as speech is heard;
     those are sent to `console.partial` (live line). When a pause finishes an
@@ -97,17 +100,18 @@ class Transcriber:
         except queue.Empty:
             pass
 
-    def push_pcm(self, samples, sample_rate):
-        """Inject mono float32 audio into this transciber (e.g. Viewer mic when
-        it replaces the Host mic for meeting + "You" text)."""
-        if self.stop_event.is_set():
-            return
-        mono = np.asarray(samples, dtype=np.float32).reshape(-1)
-        if mono.size == 0:
-            return
-        mono = resample(mono, int(sample_rate), TARGET_SR)
-        mono = np.clip(mono, -1.0, 1.0)
-        self.audio_queue.put((mono * 32767).astype(np.int16).tobytes())
+    def _resolve_device(self):
+        """Pick the capture device for this source given current mic mode."""
+        if self.source == "microphone":
+            if viewer_mic_active():
+                device = find_cable_output_microphone()
+                if device is None:
+                    return None, 1, "cable-output (missing)"
+                return device, 1, f"cable-output {device.name!r}"
+            device = find_microphone()
+            return device, 1, f"host-mic {getattr(device, 'name', device)!r}"
+        device = find_loopback()
+        return device, 2, f"loopback {getattr(device, 'name', device)!r}"
 
     # --- audio capture (runs in its own thread) ---
 
@@ -120,41 +124,62 @@ class Transcriber:
             ctypes.windll.ole32.CoInitializeEx(None, 0)  # 0 = COINIT_MULTITHREADED
 
         try:
-            # A real mic is usually mono; loopback follows the (stereo) speakers.
-            if self.source == "microphone":
-                device = find_microphone()
-                channels = 1
-                get_logger().info("audio: capturing from microphone %r",
-                                  getattr(device, "name", device))
-                self.console.info("[audio] capturing microphone...")
-            else:
-                device = find_loopback()
-                channels = 2
-                get_logger().info("audio: capturing from loopback %r",
-                                  getattr(device, "name", device))
-                self.console.info("[audio] capturing system audio...")
+            while not self.stop_event.is_set():
+                epoch = capture_epoch()
+                mic_on = viewer_mic_active()
+                try:
+                    device, channels, label = self._resolve_device()
+                except Exception:
+                    get_logger().exception(
+                        "audio: resolve device failed (source=%s)", self.source)
+                    if self.stop_event.wait(0.5):
+                        break
+                    continue
 
-            with device.recorder(
-                samplerate=CAPTURE_SR,
-                channels=channels,
-                blocksize=BLOCK_FRAMES,
-            ) as recorder:
-                while not self.stop_event.is_set():
-                    data = recorder.record(numframes=BLOCK_FRAMES)
+                if device is None:
+                    # Mic ON but CABLE Output not visible yet — wait and retry.
+                    get_logger().warning(
+                        "audio: %s not ready — retrying", label)
+                    if self.stop_event.wait(0.5):
+                        break
+                    continue
 
-                    # Mic ON: "You" comes from client mic via push_pcm, not host mic.
-                    if self.source == "microphone" and viewer_mic_active():
-                        continue
+                get_logger().info(
+                    "audio: Deepgram capturing %s (epoch %s, mic_on=%s)",
+                    label, epoch, mic_on)
+                try:
+                    self.console.info(f"[audio] capturing {label}...")
+                except Exception:
+                    pass
 
-                    # Average to mono. record() returns shape (frames, channels),
-                    # so this collapses cleanly whether channels is 1 or 2.
-                    mono = np.mean(data, axis=1) if data.ndim > 1 else data
-                    mono = resample(mono, CAPTURE_SR, TARGET_SR)
-                    mono = np.clip(mono, -1, 1)
+                try:
+                    with device.recorder(
+                        samplerate=CAPTURE_SR,
+                        channels=channels,
+                        blocksize=BLOCK_FRAMES,
+                    ) as recorder:
+                        while not self.stop_event.is_set():
+                            # Reopen when mic mode flips or playback default was
+                            # restored (loopback must rebind to headphones).
+                            if capture_epoch() != epoch:
+                                break
+                            if self.source == "microphone" and (
+                                    viewer_mic_active() != mic_on):
+                                break
 
-                    pcm16 = (mono * 32767).astype(np.int16).tobytes()
-                    self.audio_queue.put(pcm16)
-            get_logger().info("audio: capture stopped")
+                            data = recorder.record(numframes=BLOCK_FRAMES)
+                            mono = np.mean(data, axis=1) if data.ndim > 1 else data
+                            mono = resample(mono, CAPTURE_SR, TARGET_SR)
+                            mono = np.clip(mono, -1, 1)
+                            pcm16 = (mono * 32767).astype(np.int16).tobytes()
+                            self.audio_queue.put(pcm16)
+                except Exception:
+                    get_logger().exception(
+                        "audio: capture session failed (source=%s)", self.source)
+                    if self.stop_event.wait(0.5):
+                        break
+
+            get_logger().info("audio: capture stopped (source=%s)", self.source)
         except Exception:
             get_logger().exception("audio: capture worker failed")
             try:

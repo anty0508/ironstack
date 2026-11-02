@@ -64,6 +64,18 @@ def find_cable_input_speaker():
     return None
 
 
+def find_cable_output_microphone():
+    """Capture endpoint meeting apps use as mic (CABLE Output). None if missing."""
+    try:
+        for mic in sc.all_microphones(include_loopback=False):
+            name = mic.name.lower()
+            if any(m in name for m in CABLE_OUTPUT_MARKERS):
+                return mic
+    except Exception:
+        get_logger().exception("vbcable: could not list microphones")
+    return None
+
+
 def _verify_pack(path: Path) -> None:
     dig = hashlib.sha256()
     with path.open("rb") as f:
